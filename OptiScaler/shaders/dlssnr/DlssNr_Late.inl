@@ -674,7 +674,6 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
         frame.SubmissionEpoch = epoch;
         if (slot.depth) Barrier(cmd, slot.depth.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Barrier(cmd, slot.motion.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        DlssNrNative::SetPrecision(Config::Instance()->DlssNrPrecision.value_or_default());
         ID3D12Resource* nrColor = color.Get();
         bool colorReady = true;
         DlssNrConstants conversion {};
@@ -955,7 +954,6 @@ static bool ApplyFinishedPictureInput(ID3D12CommandQueue* queue, ID3D12GraphicsC
     // after the frame source executed the previous frame's list.
     frame.SubmissionEpoch = epoch;
 
-    DlssNrNative::SetPrecision(Config::Instance()->DlssNrPrecision.value_or_default());
     const auto before = g_nr.successfulDispatches;
     ID3D12Resource* nrColor = color;
     DlssNrConstants conversion {};

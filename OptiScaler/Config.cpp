@@ -1106,8 +1106,8 @@ void Config::ReadDlssNr()
     DlssNrSecondaryFeatures.set_from_config(readUInt("DlssNr", "SecondaryFeatures"));
     // ResidualFG and ResidualFGApproxCamera are no longer read: NR every second frame through NVIDIA Frame
     // Generation is off for good, whatever an old ini says.
-    DlssNrPrecision.set_from_config(readUInt("DlssNr", "Precision"));
-    if (DlssNrPrecision.value_or_default() != 4) DlssNrPrecision = 0u;
+    // Precision (the FP8+NVFP4 hybrid model) was removed: the model always runs NVIDIA's FP8; an old ini key is
+    // ignored.
     DlssNrVitEvery.set_from_config(readUInt("DlssNr", "VitEvery"));
     if (DlssNrVitEvery.value_or_default() < 1u || DlssNrVitEvery.value_or_default() > 2u)
         DlssNrVitEvery = std::clamp<uint32_t>(DlssNrVitEvery.value_or_default(), 1u, 2u);
@@ -1438,7 +1438,6 @@ static void WriteDlssNr(Config& c, CSimpleIniA& out)
                  GetBoolValue(c.DlssNrDeferredDlss.value_for_config()).c_str());
     out.SetValue("DlssNr", "MultiViewScreens", GetIntValue(c.DlssNrMultiViewScreens.value_for_config()).c_str());
     out.SetValue("DlssNr", "SecondaryFeatures", GetIntValue(c.DlssNrSecondaryFeatures.value_for_config()).c_str());
-    out.SetValue("DlssNr", "Precision", GetIntValue(c.DlssNrPrecision.value_for_config()).c_str());
     out.SetValue("DlssNr", "VitEvery", GetIntValue(c.DlssNrVitEvery.value_for_config()).c_str());
     out.SetValue("DlssNr", "VitEveryPlain", GetIntValue(c.DlssNrVitEveryPlain.value_for_config()).c_str());
     out.SetValue("DlssNr", "DetailReuse", GetBoolValue(c.DlssNrDetailReuse.value_for_config()).c_str());
@@ -1896,7 +1895,6 @@ size_t Config::ApplyDlssNrSection(const DlssNrProfiles::Section& section)
         NR_PROFILE_FIELD("RunBeforeSR", DlssNrRunBeforeSr),
         NR_PROFILE_FIELD("DeferredDLSS", DlssNrDeferredDlss),
         NR_PROFILE_FIELD("FinishedPicture", DlssNrFinishedPicture),
-        NR_PROFILE_FIELD("Precision", DlssNrPrecision),
         NR_PROFILE_FIELD("Preset", DlssNrPreset),
         NR_PROFILE_FIELD("WorkingScale", DlssNrWorkingScale),
         NR_PROFILE_FIELD("ModelResolutionAuto", DlssNrModelResolutionAuto),

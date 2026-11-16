@@ -618,15 +618,14 @@ static bool InheritedProfileCombo(const char* label, CustomOptional<uint32_t, No
     return true;
 }
 
-// This fork's starting point for the "Model passes" slider, one per pass count: the count, and NR on, on FP8 and with
-// the model applied. How each pass looks is the look presets' (DlssNr_LookPresets.h), so picking a pass count never
+// This fork's starting point for the "Model passes" slider, one per pass count: the count, and NR on with the model
+// applied. How each pass looks is the look presets' (DlssNr_LookPresets.h), so picking a pass count never
 // undoes a look and a look never undoes this; the multipass profiles these buttons used to write are the Natural
 // look's.
 // What a pass preset overwrites besides the pass count, kept for this session so "Put my settings back" can undo it.
 // Unset stays unset on the way back (auto, not its default number).
 struct PassPresetUndo
 {
-    std::optional<uint32_t> precision;
     std::optional<bool> unlockPasses;
     std::optional<uint32_t> whitePointSource;
     std::optional<float> autoExposureTrim;
@@ -634,13 +633,12 @@ struct PassPresetUndo
 
     static PassPresetUndo Read(const Config* config)
     {
-        return { config->DlssNrPrecision, config->DlssNrUnlockPasses, config->DlssNrWhitePointSource,
-                 config->DlssNrAutoExposureTrim, config->DlssNrMaxRatio };
+        return { config->DlssNrUnlockPasses, config->DlssNrWhitePointSource, config->DlssNrAutoExposureTrim,
+                 config->DlssNrMaxRatio };
     }
 
     void Write(Config* config) const
     {
-        config->DlssNrPrecision = precision;
         config->DlssNrUnlockPasses = unlockPasses;
         config->DlssNrWhitePointSource = whitePointSource;
         config->DlssNrAutoExposureTrim = autoExposureTrim;
@@ -659,7 +657,6 @@ static void ApplyPassPreset(Config* config, unsigned int passes)
     const PassPresetUndo before = PassPresetUndo::Read(config);
 
     config->DlssNrEnabled = true;
-    config->DlssNrPrecision = 0u; // NVIDIA (FP8)
     config->DlssNrApplyModel = true;
     config->DlssNrUnlockPasses = false;
     config->DlssNrPasses = passes;
@@ -2306,12 +2303,11 @@ static void RenderStatusPage(Config* config, float menuResScale, const NrCommon&
             if (PresetButton(PassPresetNames[passes - 1], PassPresetActive(config, passes), presetWidth))
                 ApplyPassPreset(config, passes);
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s",
-                                  "Also sets Model precision to NVIDIA (FP8), turns off Lift model pass limit and "
-                                  "puts exposure back to its default (White point source Auto, Automatic's "
-                                  "brightness slider at its default, Highlight guard 2.0x).");
+                ImGui::SetTooltip("%s", "Also turns off Lift model pass limit and puts exposure back to its default "
+                                        "(White point source Auto, Automatic's brightness slider at its default, "
+                                        "Highlight guard 2.0x).");
         }
-        HelpMarker("Sets the pass count, with NR on FP8 and the default exposure. How each pass looks is the Look "
+        HelpMarker("Sets the pass count, with the default exposure. How each pass looks is the Look "
                    "presets'. Green and marked > = this pass count is in effect.");
 
         // A preset's exposure reset is easy to trigger while only meaning to change the pass count: offer the way back
@@ -2325,7 +2321,7 @@ static void RenderStatusPage(Config* config, float menuResScale, const NrCommon&
                 g_passPresetUndo->first.Write(config);
                 g_passPresetUndo.reset();
             }
-            HelpMarker("Puts back the exposure, Highlight guard, Model precision and Lift model pass limit the pass "
+            HelpMarker("Puts back the exposure, Highlight guard and Lift model pass limit the pass "
                        "preset replaced (the pass count stays). Gone once you change one of them yourself.");
         }
 
@@ -3341,7 +3337,7 @@ static void RenderOptionsPage(Config* config, float menuResScale, const NrCommon
         //
         // A Combo, not inline RadioButtons: this panel's width isn't user-resizable, and three
         // radios with these labels ran off the visible edge with no way to reach the third one.
-        // Every other 3+-option control in this file (Model precision right below, Upscale Mode,
+        // Every other 3+-option control in this file (Upscale Mode,
         // Upscale Method, Final Image Composition) is already a Combo for the same reason.
         static const char* placementNames[] = { "After Super Resolution", "Before Super Resolution",
                                                 "Finished Picture" };
@@ -3444,27 +3440,8 @@ static void RenderOptionsPage(Config* config, float menuResScale, const NrCommon
             ImGui::TextWrapped("Pre-SR changes: %s", DlssNr::DeferredDlssStatus().c_str());
     }
 
-    // Keep failure details in the log without displaying changing kernel counters in the menu.
-    auto hybridStatus = DlssNrNative::Status();
-    hybridStatus = hybridStatus.substr(0, hybridStatus.find(" |"));
-    static std::string lastHybridWarning;
-    if (hybridStatus.rfind("Restart required:", 0) == 0 || hybridStatus.find("fallback") != std::string::npos)
-    {
-        if (hybridStatus != lastHybridWarning)
-            LOG_WARN("Hybrid: {}", hybridStatus);
-        lastHybridWarning = hybridStatus;
-    }
-    else
-        lastHybridWarning.clear();
-
     if (auto card = ScopedCollapsingHeader("Model and speed", ImGuiTreeNodeFlags_DefaultOpen); card.IsHeaderOpen())
     {
-        int precisionChoice = config->DlssNrPrecision.value_or_default() == 4 ? 1 : 0;
-        const char* precisions[] = { "NVIDIA (FP8)", "Experimental (FP8+NVFP4 hybrid)" };
-        if (ImGui::Combo("Model precision", &precisionChoice, precisions, IM_ARRAYSIZE(precisions)))
-            config->DlssNrPrecision = precisionChoice == 1 ? 4u : 0u;
-        HelpMarker("NVIDIA: the original FP8 model. Default.\n"
-                   "FP8+NVFP4: this fork's mixed-precision model for RTX 50; output may differ slightly. D3D12 only.");
         // One setting per kernel set: the fp8 kernels (NVIDIA's DLL and fp8-based builds) and the plain FP16 kernels
         // (used by some modified DLSS-NR DLLs). Only the one for the kernels actually running is used.
         // Once a frame has shown which set runs, only its checkbox is drawn (the other stays in the ini).
@@ -3489,33 +3466,6 @@ static void RenderOptionsPage(Config* config, float menuResScale, const NrCommon
                        "by some modified DLSS-NR DLLs). On by default.");
         }
         ImGui::TextDisabled("Kernel set in use: %s", kernelSet);
-        if (precisionChoice > 0 && DlssNr::IsRunningVk())
-        {
-            // The hybrid rewrites the model's kernels through NvAPI's D3D12 entry points; on Vulkan the model runs
-            // unchanged.
-            ImGui::TextUnformatted("Hybrid: D3D12 only (not applied on Vulkan)");
-        }
-        else if (precisionChoice > 0)
-        {
-            const bool hybridActive = enabled && DlssNrNative::IsActive();
-            ImGui::TextUnformatted(hybridActive ? "Hybrid: active" : "Hybrid: inactive");
-
-            // The hybrid falls back to FP8 on its own (a shape or GPU it has no kernels for): say why here, not only
-            // in the log, or the combo claims a model that is not running.
-            const char* hybridWhy = nullptr;
-            if (lastHybridWarning.rfind("Restart required:", 0) == 0)
-                hybridWhy = "The hybrid model stopped: restart the game to use it again (details in OptiScaler.log).";
-            else if (!hybridActive && !lastHybridWarning.empty())
-                hybridWhy = "The hybrid model cannot run here (GPU or model size): NVIDIA (FP8) runs instead. "
-                            "Details in OptiScaler.log.";
-            if (hybridWhy != nullptr)
-            {
-                ImGui::PushStyleColor(ImGuiCol_Text, kWarnAmber);
-                ImGui::TextWrapped("%s", hybridWhy);
-                ImGui::PopStyleColor();
-            }
-            ImGui::TextWrapped("Loading may pause the game and look like a freeze. Please wait.");
-        }
         if (detailReuseRunning)
             ImGui::TextDisabled("Bottleneck reuse: off while Reuse detail between frames runs");
         else if (DlssNrNative::VitPlainKernels() ? vitReusePlain : vitReuse)

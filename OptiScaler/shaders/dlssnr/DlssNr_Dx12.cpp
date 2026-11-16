@@ -7023,15 +7023,6 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
     // present-time Finished Picture pass would run on the presenting queue, which is not the game's when the library
     // presents itself.
     const bool finishedPictureOn = FinishedPictureEffective();
-    static unsigned lastPrecision=0;
-    const unsigned precision=cfg.DlssNrPrecision.value_or_default();
-    if(lastPrecision!=precision)
-    {
-        RetryAfterFailure();
-        DeferredSr::Cancel();
-        lastPrecision = precision;
-    }
-    DlssNrNative::SetPrecision(precision);
 
     if (!cfg.DlssNrEnabled.value_or_default())
     {

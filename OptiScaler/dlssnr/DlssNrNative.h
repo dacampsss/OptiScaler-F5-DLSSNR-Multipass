@@ -4,11 +4,7 @@
 #include <vector>
 struct ID3D12GraphicsCommandList;
 namespace DlssNrNative {
-void* WrapNvapi(unsigned id,void* original);
-void SetEnabled(bool enabled);
-void SetPrecision(unsigned precision);
-bool IsActive();
-std::string Status();
+void* WrapNvapi(unsigned id, void* original);
 // ViT reuse (see DlssNrVitReuse.h): bracket one model evaluation of `feature`. `every` = how often the ViT bottleneck is computed (1 = always) with the fp8 kernel set, `everyPlain` with the plain fp16 one; `slot` = frame number, the same for every pass of a frame, so the passes compute on the same frame.
 // `copySets` (DlssNrVitReuse::kCopyPlain, kCopyFp8): the kernel sets that reuse through our own copy of the ViT output (copy mode; recorded by the D3D12 launch path here and by DlssNrNative_Vk.cpp on Vulkan).
 void BeginEvaluate(const void* feature, bool reset, unsigned every, unsigned everyPlain, long long slot, ID3D12GraphicsCommandList* cmd, bool profile, unsigned copySets);
