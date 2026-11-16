@@ -3440,7 +3440,9 @@ static void RenderOptionsPage(Config* config, float menuResScale, const NrCommon
             ImGui::TextWrapped("Pre-SR changes: %s", DlssNr::DeferredDlssStatus().c_str());
     }
 
-    if (auto card = ScopedCollapsingHeader("Model and speed", ImGuiTreeNodeFlags_DefaultOpen); card.IsHeaderOpen())
+    // Everything that trades NR's GPU time against quality, in one card: Reuse bottleneck, Reuse detail between frames,
+    // and the pass limit.
+    if (auto card = ScopedCollapsingHeader("Performance", ImGuiTreeNodeFlags_DefaultOpen); card.IsHeaderOpen())
     {
         // One setting per kernel set: the fp8 kernels (NVIDIA's DLL and fp8-based builds) and the plain FP16 kernels
         // (used by some modified DLSS-NR DLLs). Only the one for the kernels actually running is used.
@@ -3470,15 +3472,8 @@ static void RenderOptionsPage(Config* config, float menuResScale, const NrCommon
             ImGui::TextDisabled("Bottleneck reuse: off while Reuse detail between frames runs");
         else if (DlssNrNative::VitPlainKernels() ? vitReusePlain : vitReuse)
             ImGui::TextUnformatted(("Bottleneck reuse: " + DlssNrNative::VitStatus()).c_str());
-        if (ImGui::Checkbox("Lift model pass limit (up to 30; expensive)", &unlockPasses))
-            config->DlssNrUnlockPasses = unlockPasses;
-        HelpMarker("Allow up to 30 passes instead of 3. More passes use more GPU time and VRAM; high values may crash "
-                   "the game.");
-    }
 
-    if (auto card = ScopedCollapsingHeader("Reuse detail between frames", ImGuiTreeNodeFlags_DefaultOpen);
-        card.IsHeaderOpen())
-    {
+        ImGui::Spacing();
         detailReuse = RenderDetailReuseToggle(config);
         if (detailReuse)
         {
@@ -3580,6 +3575,12 @@ static void RenderOptionsPage(Config* config, float menuResScale, const NrCommon
                 ImGui::TreePop();
             }
         }
+
+        ImGui::Spacing();
+        if (ImGui::Checkbox("Lift model pass limit (up to 30; expensive)", &unlockPasses))
+            config->DlssNrUnlockPasses = unlockPasses;
+        HelpMarker("Allow up to 30 passes instead of 3. More passes use more GPU time and VRAM; high values may crash "
+                   "the game.");
     }
 
     if (auto card = ScopedCollapsingHeader("Behaviour", ImGuiTreeNodeFlags_DefaultOpen); card.IsHeaderOpen())
