@@ -3,6 +3,7 @@
 #include <dlssnr/DlssNr_SuperiorScaling.h>
 #include <dlssnr/DlssNr_SuperiorGains.h>
 #include <dlssnr/DlssNr_GpuLifetime.h>
+#include <dlssnr/DlssNr_AllocatorEpochs.h>
 #include <output/SdrToHdr_ProxyDx12.h>
 #include <native/DriverInitGate.h>
 
@@ -60,6 +61,7 @@
 #include <proxies/NVNGX_Proxy.h>
 #include <hooks/D3D12_Hooks.h>
 #include <gpu_time/GpuTime_Dx12.h>
+#include <native/GpuMarker.h>
 #include "DlssNr_WatchedLists.h"
 #include "DlssNr_GpuTime.h"
 
@@ -2684,6 +2686,7 @@ void ParkIdleViews()
 // of OptiScaler sees.
 // ---------------------------------------------------------------------------------------------
 
+#include <dlssnr/DlssNr_SuperiorPrivatePolicy.h>
 #include "superior/Pipeline.inl"
 
 DlssNr_Dx12::DlssNr_Dx12(std::string InName, ID3D12Device* InDevice)
@@ -2801,6 +2804,10 @@ bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssN
         parallelExposureMeter ? InConstants.Width : (InConstants.Width + _numThreadsX - 1) / _numThreadsX;
     const UINT dispatchHeight =
         parallelExposureMeter ? InConstants.Height : (InConstants.Height + _numThreadsY - 1) / _numThreadsY;
+    if (GpuMarkers::On())
+        GpuMarkers::Mark(
+            InCmdList,
+            std::format(L"NR pass mode {} {}x{}", (int) InConstants.Mode, dispatchWidth, dispatchHeight).c_str());
     InCmdList->Dispatch(dispatchWidth, dispatchHeight, 1);
 
     return true;
@@ -3658,6 +3665,10 @@ bool DlssNr_Dx12::DispatchResidualPass(ID3D12GraphicsCommandList* InCmdList,
 
     const UINT dispatchWidth = (InConstants.Width + _numThreadsX - 1) / _numThreadsX;
     const UINT dispatchHeight = (InConstants.Height + _numThreadsY - 1) / _numThreadsY;
+    if (GpuMarkers::On())
+        GpuMarkers::Mark(
+            InCmdList,
+            std::format(L"NR pass mode {} {}x{}", (int) InConstants.Mode, dispatchWidth, dispatchHeight).c_str());
     InCmdList->Dispatch(dispatchWidth, dispatchHeight, 1);
 
     return true;
@@ -3689,6 +3700,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     {
         superiorState.wasSelected = superiorSelected;
         superiorState.unavailable.clear();
+        superiorState.srUnavailable = false;
     }
     const bool superior = superiorSelected && superiorState.unavailable.empty() && !g_multiRun && !g_contextRun;
     // A secondary game feature's own model never runs it: that is no change of the main picture's choice
@@ -3698,6 +3710,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         g_nr.reset = true;
         SuperiorRun::Drop();
     }
+    if (!superior && !g_contextRun)
+        SuperiorRun::Idle();
 
     // Depth is the one input the model can run without: NVIDIA's own retail DLL treats it as an optional
     // refinement of motion-vector dilation at object edges (it is null in every known capture, including
@@ -4524,9 +4538,6 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         ResTrack_Dx12::HookLateNrQueue(device);
         const bool temporal = DlssNr::SuperiorScaling::NeedsTemporal(width, height, workWidth, workHeight, spatial,
                                                                      modelWidth, modelHeight);
-        // Wait: the private DLSS was just created, its first evaluate waits for a later submission (one frame, like
-        // the NR feature's own creation). Unavailable: given up for this session (logged once); this frame is skipped
-        // and from the next one the ordinary path runs with Matched residual.
         if (SuperiorRun::Begin(*this, cmdList, device, colourFormat, width, height,
                                superiorPacked ? modelWidth : workWidth, superiorPacked ? modelHeight : workHeight,
                                workScale, frame, temporal, depth && guides.depth.valid(),
@@ -4638,6 +4649,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     if (g_gpuTime != nullptr)
         g_gpuTime->Start(cmdList);
+    GpuMarkers::Mark(cmdList, L"NR: dispatch begin");
 
     // Copy just the live image, not the stale right/bottom margins. Do this only after model
     // creation/pending-submission early returns, and inside the measured GPU interval. The compact
@@ -5367,7 +5379,9 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         if (timeScan)
             g_scanTime->Start(cmdList);
 
+        GpuMarkers::Mark(cmdList, L"NR: exposure scan");
         const bool copied = DlssNr::ExposureScan::Tick(device, cmdList, scanFrame);
+        GpuMarkers::Mark(cmdList, L"NR: exposure scan end");
 
         if (timeScan && copied)
             g_scanTime->End(cmdList);
@@ -5931,6 +5945,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     // The model's own time: the passes alone, so the detail reuse work above counts as surrounding work (and a reused
     // frame's model time is about zero).
+    GpuMarkers::Mark(cmdList, L"NR: model passes begin");
     if (g_ngxTime != nullptr)
         g_ngxTime->Start(cmdList);
 
@@ -5984,7 +5999,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         finalAnswer = passOutput;
         MakeModelReadable(finalAnswer);
         superiorCompleted = pass + 1u;
-        if (superiorGeneration && (superiorGeneration->temporal || (spatial && superiorGainScales.low < 1.0f)) &&
+        // Frequency shaping between passes needs no private DLSS: No DLSS shapes like CNN and Transformer do.
+        if (superiorGeneration && (superiorGeneration->shaping || (spatial && superiorGainScales.low < 1.0f)) &&
             pass + 1u < effectivePasses)
         {
             const bool due = superiorSchedule.Due(pass, superiorCovered);
@@ -6117,6 +6133,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         }
     }
 
+    GpuMarkers::Mark(cmdList, L"NR: model passes end");
     if (g_ngxTime != nullptr)
         g_ngxTime->End(cmdList);
 
@@ -6511,35 +6528,42 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         // the output takes a UAV, so resolveTarget is the output there)
         if (cached)
             EditCache::ApplyCached(cacheFrame, resolveTarget);
-        else if (superiorGeneration && (superiorGeneration->temporal || (spatial && superiorGainScales.low < 1.0f)))
+        else if (superiorGeneration && (superiorGeneration->shaping || (spatial && superiorGainScales.low < 1.0f)))
         {
             auto& g = *superiorGeneration;
-            auto* shapingProxy = g.packed ? modelInput : g.temporal ? ordinaryProxy : resolveProxy;
-            auto* residual =
-                g.temporal
-                    ? SuperiorRun::Stabilize(g, *this, cmdList, shapingProxy, g.packed ? finalAnswer : ordinaryAnswer,
-                                             motionIn, guides, frame, superiorReset, g_nr.heldActive,
-                                             g.packed ? EdgeCompression::depth : nullptr,
-                                             g.packed ? EdgeCompression::motion : nullptr,
-                                             { spatialGuideLayout.modelW, spatialGuideLayout.modelH },
-                                             SuperiorDepthPrecision(guideDesc.Format))
-                    : resolveAnswer;
+            auto* shapingProxy = g.packed ? modelInput : g.shaping ? ordinaryProxy : resolveProxy;
+            auto* answer = g.packed ? finalAnswer : g.shaping ? ordinaryAnswer : resolveAnswer;
+            auto* residual = g.PrivateReady() && depth && guides.depth.valid()
+                                 ? SuperiorRun::Stabilize(g, *this, cmdList, shapingProxy, answer, motionIn, guides,
+                                                          frame, superiorReset, g_nr.heldActive,
+                                                          g.packed ? EdgeCompression::depth : nullptr,
+                                                          g.packed ? EdgeCompression::motion : nullptr,
+                                                          { spatialGuideLayout.modelW, spatialGuideLayout.modelH },
+                                                          SuperiorDepthPrecision(guideDesc.Format))
+                                 : nullptr;
+            const bool signedResidual = residual != nullptr;
+            if (!residual)
+                residual = answer;
             const auto gains = DlssNr::SuperiorScaling::BlockGains(cfg, superiorCovered, superiorCompleted,
                                                                    superiorGainScales, g_nr.superiorMainOnlyGains);
             auto* low = residual && (gains.high != 1.0f || gains.low != 1.0f)
-                            ? SuperiorRun::FinalLow(g, *this, cmdList, shapingProxy, residual, g.temporal)
+                            ? SuperiorRun::FinalLow(g, *this, cmdList, shapingProxy, residual, signedResidual)
                             : nullptr;
             DlssNr::Superior::Fields::SetBandGains(resolveParams, gains.high, gains.low);
             DlssNr::SuperiorScaling::SetGuidedRange(resolveParams, workScale);
             // A raw NR answer when temporal stabilization is inactive, else the decoded signed DLSS residual.
-            DlssNr::Superior::Fields::SetResolveFlags(resolveParams, low != nullptr, !g.temporal);
-            auto* pso = SuperiorResolvePipeline(resolveParams, !g.temporal, g.packed, g.warpCache.Get() != nullptr);
+            DlssNr::Superior::Fields::SetResolveFlags(resolveParams, low != nullptr, !signedResidual);
+            auto* pso = SuperiorResolvePipeline(resolveParams, !signedResidual, !signedResidual && g.shaping, g.packed,
+                                                g.warpCache.Get() != nullptr);
             const bool lowReady = (gains.high == 1.0f && gains.low == 1.0f) || low != nullptr;
             composed = residual && lowReady && pso &&
                        DispatchPass(cmdList, resolveParams, shapingProxy, residual, resolveOriginal,
                                     g.packed ? (g.warpCache.Get() ? g.warpCache.Get() : g.warp.Get()) : motionIn,
                                     exposureTex, resolveTarget, nullptr, low, pso);
-            SuperiorRun::Say(composed ? "" : "Superior reconstruction failed; keeping the game frame.");
+            if (!composed)
+                SuperiorRun::Fail("Superior reconstruction failed; keeping the game frame.", frame.SubmissionEpoch);
+            else
+                SuperiorRun::Composed(frame.SubmissionEpoch);
         }
         else
         {
@@ -6893,6 +6917,22 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 namespace DlssNr
 {
 namespace Late { bool CaptureResidual(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*, float, bool); }
+
+// Depth of ScopedNrInList on this thread.
+static thread_local int g_nrInListDepth = 0;
+
+ScopedNrInList::ScopedNrInList() { ++g_nrInListDepth; }
+ScopedNrInList::~ScopedNrInList() { --g_nrInListDepth; }
+
+// [DlssNr] FinishedPicture as this call sees it: off while a ScopedNrInList lives (the virtual upscaler's backend pass
+// under frame generation works in its list). Every read of the setting that decides where NR runs for an evaluate uses
+// this one (EvaluateInternal, the deferred mode), so they agree; the present-time pass (DlssNr_Late.inl) runs outside
+// the scope.
+static bool FinishedPictureEffective()
+{
+    return g_nrInListDepth == 0 && Config::Instance()->DlssNrFinishedPicture.value_or_default();
+}
+
 #include "DlssNr_DeferredSr.inl"
 std::string DeferredDlssStatus() { return SynchronousDeferredDlssStatus(); }
 
@@ -6917,7 +6957,12 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
                       uint32_t gameFeature)
 {
     std::lock_guard<std::recursive_mutex> nrLock(g_nrMutex);
+    SuperiorRun::Evaluated();
     const Config& cfg = *Config::Instance();
+    // The virtual upscaler's backend pass under frame generation (ScopedNrInList) works in its own list: the
+    // present-time Finished Picture pass would run on the presenting queue, which is not the game's when the library
+    // presents itself.
+    const bool finishedPictureOn = FinishedPictureEffective();
     static unsigned lastPrecision=0;
     const unsigned precision=cfg.DlssNrPrecision.value_or_default();
     if(lastPrecision!=precision)
@@ -7016,7 +7061,7 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
         if (role.kind == Contexts::Kind::Own)
         {
             // One picture's modes cannot run on a second one
-            if (cfg.DlssNrFinishedPicture.value_or_default() || cfg.DlssNrDeferredDlss.value_or_default())
+            if (finishedPictureOn || cfg.DlssNrDeferredDlss.value_or_default())
             {
                 ReportSkipOnce("another DLSS feature of the game: Finished picture and Deferred DLSS work on the main "
                                "one only");
@@ -7077,8 +7122,7 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
         }
 
         // The finished-picture and deferred modes keep one picture of their own and stage from the origin.
-        const bool ownPictureModes =
-            cfg.DlssNrFinishedPicture.value_or_default() || cfg.DlssNrDeferredDlss.value_or_default();
+        const bool ownPictureModes = finishedPictureOn || cfg.DlssNrDeferredDlss.value_or_default();
         if (view.slot >= 0 && ownPictureModes)
         {
             ReportSkipOnce("several views are drawn: Finished picture and Deferred DLSS work on one picture only");
@@ -7094,8 +7138,13 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
         g_multiRun = viewLatched && Views::CountRuns(mask) >= 2;
     }
 
-    const unsigned finishedMode = !cfg.DlssNrFinishedPicture.value_or_default() ? 0u :
-        (cfg.DlssNrRunBeforeSr.value_or_default() || cfg.DlssNrDeferredDlss.value_or_default()) ? 2u : 1u;
+    const unsigned finishedMode =
+        !finishedPictureOn                                                                        ? 0u
+        : (cfg.DlssNrRunBeforeSr.value_or_default() || cfg.DlssNrDeferredDlss.value_or_default()) ? 2u
+                                                                                                  : 1u;
+    // Scoped (ScopedNrInList) and unscoped calls in one frame would flip this on every call and reset NR's history each
+    // time. They do not mix today: the virtual upscaler, the only scoped caller, stands aside while the game calls its
+    // own upscaler.
     static unsigned lastFinishedMode = 0;
     if (lastFinishedMode != finishedMode)
     {
@@ -7321,6 +7370,12 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
         return;
     }
 
+    // Past the refusals above: NR goes on from here. The Finished Picture status line says where, for a setting it is
+    // on for.
+    if (g_nrInListDepth > 0 && cfg.DlssNrFinishedPicture.value_or_default())
+        Late::Say(
+            "Neural Rendering runs on the upscaler pass's output before frame generation, in the game's own commands.");
+
     unsigned int createFlags = 0;
     params->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &createFlags);
 
@@ -7352,7 +7407,7 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
     ApplyColourEncoding(frame, Config::Instance()->DlssNrColourEncoding.value_or_default(),
                         (createFlags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0,
                         colourAuthority != nullptr ? colourAuthority->GetDesc().Format : DXGI_FORMAT_UNKNOWN,
-                        !Config::Instance()->DlssNrFinishedPicture.value_or_default());
+                        !finishedPictureOn);
 
     // The game telling the upscaler to forget everything it has accumulated: a cut, a teleport, a
     // load. Every upscaler in this tree reads it and this pass did not, so the model's history was
@@ -8080,7 +8135,8 @@ void Shutdown()
 std::string DlssNr::SuperiorScaling::Status()
 {
     std::lock_guard<std::recursive_mutex> lock(g_nrMutex);
-    return SuperiorRun::GetState().status;
+    const auto& s = SuperiorRun::GetState();
+    return s.failure.empty() ? s.status : s.failure;
 }
 
 std::string DlssNr::SuperiorScaling::Unavailable()

@@ -1,11 +1,13 @@
 #include "pch.h"
 
 #include "VirtualUpscalerDriver.h"
+#include "GpuMarker.h"
 
 #include "DepthFinderCore.h"
 #include "VirtualUpscalerMode.h"
 
 #include <atomic>
+#include <optional>
 #include <NVNGX_Parameter.h>
 #include <State.h>
 #include <Config.h>
@@ -499,6 +501,9 @@ bool VirtualUpscalerDriver::Run(ID3D12GraphicsCommandList* cmd, const NativeFram
     bool nrRan = false;
 
     if (route == VuNrRoute::InPlace)
+        GpuMarkers::Mark(cmd, L"VU: NR in place");
+
+    if (route == VuNrRoute::InPlace)
         nrRan = DlssNr::ApplyVirtualUpscalerInput(queue, cmd, frame.color, frame.depth, frame.motion,
                                                   frame.historyDistrust, frame.depthReversed, frame.reset, colorSpace,
                                                   frame.pictureState, epoch);
@@ -544,9 +549,23 @@ bool VirtualUpscalerDriver::Run(ID3D12GraphicsCommandList* cmd, const NativeFram
     Transition(cmd, depth, kRead, inDepth);
     Transition(cmd, _output, kWrite, inOutput);
 
-    // DLSS-NR hangs off NVSDK_NGX_D3D12_EvaluateFeature around the upscaler, not off the feature: before it (Run before SR,
-    // or the finished-picture capture of depth and motion) and after it (over Output). Not with the backend's pass off:
-    // NR already ran on the picture itself, above, and would otherwise run twice.
+    // DLSS-NR hangs off NVSDK_NGX_D3D12_EvaluateFeature around the upscaler, not off the feature: before it (Run before
+    // SR, or the finished-picture capture of depth and motion) and after it (over Output). Not with the backend's pass
+    // off: NR already ran on the picture itself, above, and would otherwise run twice.
+    //
+    // With the backend's pass and frame generation running, NR works on the pass's output in this list, as in place
+    // does: frame generation copies the picture next. Finished Picture (an ini setting for NR Only mode) would leave it
+    // to the present, and a frame generation library that presents on its own queue runs that there.
+    std::optional<DlssNr::ScopedNrInList> nrInList;
+
+    // With an XeFG API output (XeFG, F5Low) owning the swap chain on a native D3D12 game, active or not: it activates,
+    // deactivates and activates again at start, and NR must not move between the list and the present with that (it
+    // resets NR's history). Not under the D3D11 or Vulkan bridge, where this stays as it was.
+    if (route == VuNrRoute::BackendPass && state.swapchainInteropApi == SwapchainInteropApi::None &&
+        state.currentFG != nullptr && state.currentFGSwapchain != nullptr && UsesXeFGApi(state.activeFgOutput))
+        nrInList.emplace();
+
+    GpuMarkers::Mark(cmd, L"VU: NR before upscale");
     if (route != VuNrRoute::InPlace)
         DlssNr::EvaluateBeforeUpscale(cmd, _params);
     _params->Set(NVSDK_NGX_Parameter_Depth, depth);
@@ -590,6 +609,7 @@ bool VirtualUpscalerDriver::Run(ID3D12GraphicsCommandList* cmd, const NativeFram
         Transition(cmd, color, D3D12_RESOURCE_STATE_COPY_SOURCE, colorNow);
     }
 
+    GpuMarkers::Mark(cmd, L"VU: frame generation inputs");
     UpscalerInputsDx12::UpscaleStart(cmd, _params, _feature.get());
     UpscalerInputsDx12::UpscaleEnd(cmd, _params, _feature.get());
 
@@ -609,6 +629,7 @@ bool VirtualUpscalerDriver::Run(ID3D12GraphicsCommandList* cmd, const NativeFram
         ScopedSkipHeapCapture skip {};
         try
         {
+            GpuMarkers::Mark(cmd, L"VU: backend evaluate");
             evaluated = _feature->Evaluate(cmd, _params);
         }
         catch (...)
@@ -620,8 +641,10 @@ bool VirtualUpscalerDriver::Run(ID3D12GraphicsCommandList* cmd, const NativeFram
 
     _params->Set(NVSDK_NGX_Parameter_Depth, frame.depth);
 
+    GpuMarkers::Mark(cmd, L"VU: NR after upscale");
     if (evaluated)
         DlssNr::EvaluateAfterUpscale(cmd, _params);
+    GpuMarkers::Mark(cmd, L"VU: NR after upscale done");
 
     if ((int) route != _routeLogged || _evaluations == 0)
     {

@@ -78,6 +78,26 @@ try {
             if ($lds.Count -ne 0) { throw "Fast PSO unexpectedly allocates LDS" }
         } # Standard shader keeps its existing exposure-meter LDS, without inter-pass cache.
     }
+    $private = Join-Path $shaders "superior"
+    Build (Join-Path $private "PrivateCarrier.hlsl") "PrivateEncode" @() "private_encode"
+    Build (Join-Path $private "PrivateCarrier.hlsl") "PrivateDecode" @() "private_fade"
+    Build (Join-Path $private "PrivateCarrier.hlsl") "PrivateDecode" @("-D", "SUPERIOR_GHOST_DECODE=1") "private_ghost_decode"
+    Build (Join-Path $private "PrivateCarrier.hlsl") "PrivateDecode" @("-D", "SUPERIOR_GHOST_DECODE=1", "-D", "SUPERIOR_GHOST_DECODE_SEED=1") "private_ghost_decode_seed" -asm
+    if (-not (Geometry "private_ghost_decode_seed" "(16,8,1)")) { throw "Unexpected ghost decode/seed group geometry" }
+    Build (Join-Path $private "PrivateMotion.hlsl") "SampleMotion" @() "private_cnn_motion"
+    Build (Join-Path $private "CompactGhost.hlsl") "ClearVisibility" @() "private_ghost_clear"
+    foreach ($stage in @(1, 2)) {
+        Build (Join-Path $private "CompactGhost.hlsl") "CompactGhostMain" @("-D", "DLSSNR_COMPACT_GHOST_STAGE=$stage", "-D", "DLSSNR_GHOST_STEP=4") "private_ghost_coarse_$stage"
+    }
+    Build (Join-Path $private "GhostContrastHistory.hlsl") "GhostContrastHistory" @("-D", "DLSSNR_CONTRAST_COMPACT=1", "-D", "DLSSNR_GHOST_STEP=4") "private_ghost_reference"
+    Build (Join-Path $private "CoarseGhostDilate.hlsl") "CoarseGhostDilate" @("-D", "DLSSNR_COARSE_RADIUS=1", "-D", "DLSSNR_GHOST_CONTRAST=1") "private_ghost_dilate"
+    Build (Join-Path $private "GhostOutwardFeather.hlsl") "GhostOutwardFeather" @("-D", "DLSSNR_GHOST_FEATHER_STAGE=0") "private_ghost_rings" -asm
+    if (-not (Geometry "private_ghost_rings" "(8,8,1)")) { throw "Unexpected ring seed group geometry" }
+    Build (Join-Path $private "GhostOutwardFeather.hlsl") "GhostOutwardFeather" @("-D", "DLSSNR_GHOST_FEATHER_STAGE=1") "private_ghost_rings_apply" -asm
+    Build (Join-Path $private "GhostOutwardFeather.hlsl") "GhostOutwardFeather" @("-D", "DLSSNR_GHOST_FEATHER_STAGE=1", "-D", "DLSSNR_GHOST_FEATHER_INPLACE=1") "private_ghost_rings_inplace" -asm
+    if (-not (Geometry "private_ghost_rings_apply" "(16,16,1)") -or -not (Geometry "private_ghost_rings_inplace" "(16,16,1)")) { throw "Unexpected ring apply group geometry" }
+    Build (Join-Path $private "GhostBiasMask.hlsl") "GhostBiasMask" @() "private_ghost_bias"
+
     foreach ($variant in @("carrier", "resolve", "cross5", "normal", "sdr", "hdr2", "hdr4", "encode", "low", "area", "meter", "exposure", "hdr0")) {
         $stem = "dlssnr_superior_$variant"
         $entry = if ($variant -eq "carrier") { "SuperiorCarrierMain" } else { "CSMain" }
@@ -148,6 +168,11 @@ try {
         if ($variant.StartsWith('cached_')) { $defines += @('-D', 'DLSSNR_SUPERIOR_HOST_CACHED=1') }
         Build $live "CSMain" $defines $stem
     }
+    $guidedRaw = @("-D", "DLSSNR_SUPERIOR_HOST_RESOLVE=1", "-D", "DLSSNR_SUPERIOR_HOST_RAW=1", "-D", "DLSSNR_SUPERIOR_GUIDED_RAW=1")
+    Build $live "CSMain" $guidedRaw "host_resolve_guided_raw"
+    $packedRaw = $guidedRaw + @("-D", "DLSSNR_SUPERIOR_HOST_PACKED=1")
+    Build $live "CSMain" $packedRaw "host_resolve_packed_guided_raw"
+    Build $live "CSMain" ($packedRaw + @("-D", "DLSSNR_SUPERIOR_HOST_CACHED=1")) "host_resolve_cached_packed_guided_raw"
     Build (Join-Path $shaders "superior/WarpCache.hlsl") "CSMain" @() "host_warp_cache"
 
     # Every shipped blob must come from this script, and nothing else may sit beside them.
