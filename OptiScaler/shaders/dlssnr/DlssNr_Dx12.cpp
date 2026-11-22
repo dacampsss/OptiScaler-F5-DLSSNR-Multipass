@@ -1008,6 +1008,11 @@ struct NrRetired
     // everything parked in one Dispatch; null when the command list hooks were not on (the item waits for
     // kStuckFrames).
     std::shared_ptr<std::atomic_bool> gpuDone;
+    // A resize shader (filter change, view reset, Compress screen edges going off): its PSO, root signature,
+    // descriptor heaps and constant buffer are bound by lists still in flight, so it waits like a texture. Deleting
+    // it on the spot reset the GPU when the NR downscaler was changed in the menu (2026-11-22, NBA 2K27).
+    OS_Dx12* scaler = nullptr;
+    SGSR1_Dx12* sgsr1 = nullptr;
 };
 
 // When they are freed: DlssNr_Retire.h.
@@ -1101,6 +1106,21 @@ void ParkNrFeature(void*& feature, void (*releaseFn)(void*) = nullptr,
     ParkNr(r);
 }
 
+// A resize shader the frame may still be using on the GPU: parked like a texture (NrRetired::scaler).
+template <typename Shader> void ParkNrShader(Shader*& shader)
+{
+    if (shader == nullptr)
+        return;
+
+    NrRetired r;
+    if constexpr (std::is_same_v<Shader, OS_Dx12>)
+        r.scaler = shader;
+    else
+        r.sgsr1 = shader;
+    shader = nullptr;
+    ParkNr(r);
+}
+
 void ParkNrResource(ID3D12Resource*& res)
 {
     if (res == nullptr)
@@ -1161,6 +1181,9 @@ void FreeNrRetiredNow(const NrRetired& r)
 
     if (r.resource != nullptr)
         r.resource->Release();
+
+    delete r.scaler;
+    delete r.sgsr1;
 }
 
 void FreeNrRetired(const NrRetired& r, bool gpuConfirmed)
@@ -1171,7 +1194,9 @@ void FreeNrRetired(const NrRetired& r, bool gpuConfirmed)
     {
         said = true;
         LOG_WARN("DLSS-NR: a parked {} was freed by time, its command lists were never reported finished",
-                 r.feature != nullptr ? "model" : "texture");
+                 r.feature != nullptr    ? "model"
+                 : r.resource != nullptr ? "texture"
+                                         : "resize shader");
     }
 
     FreeNrRetiredNow(r);
@@ -2632,13 +2657,10 @@ void ParkLoadedView()
            &g_nr.activeColorSpare, &g_nr.lutScratchSpare })
         ParkNrResource(*r);
 
-    // The scalers are deleted on the spot wherever this module drops them (a filter change); the same here.
-    delete g_nr.superUp;
-    g_nr.superUp = nullptr;
-    delete g_nr.superDown;
-    g_nr.superDown = nullptr;
-    delete g_nr.sgsr1UpAnswer;
-    g_nr.sgsr1UpAnswer = nullptr;
+    // The resize shaders wait for the GPU like the textures they write (ParkNrShader).
+    ParkNrShader(g_nr.superUp);
+    ParkNrShader(g_nr.superDown);
+    ParkNrShader(g_nr.sgsr1UpAnswer);
 
     EdgeCompression::Release();
     EdgeCompression::ReleaseDown();
@@ -5579,8 +5601,9 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             const Scaler nrScaler = cfg.DlssNrScalingDownscaler.value_or_default();
             if (g_nr.nrScaler != nrScaler)
             {
-                if (g_nr.superUp != nullptr)   { delete g_nr.superUp;   g_nr.superUp = nullptr; }
-                if (g_nr.superDown != nullptr) { delete g_nr.superDown; g_nr.superDown = nullptr; }
+                // Parked, not deleted: the last frames' lists still use them on the GPU (ParkNrShader)
+                ParkNrShader(g_nr.superUp);
+                ParkNrShader(g_nr.superDown);
                 g_nr.nrScaler = nrScaler;
             }
             if (g_nr.superUp == nullptr)
@@ -6558,8 +6581,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             const Scaler nrScaler = cfg.DlssNrScalingDownscaler.value_or_default();
             if (g_nr.nrScaler != nrScaler)
             {
-                if (g_nr.superUp != nullptr)   { delete g_nr.superUp;   g_nr.superUp = nullptr; }
-                if (g_nr.superDown != nullptr) { delete g_nr.superDown; g_nr.superDown = nullptr; }
+                ParkNrShader(g_nr.superUp);
+                ParkNrShader(g_nr.superDown);
                 EdgeCompression::ReleaseDown();
                 g_nr.nrScaler = nrScaler;
             }
