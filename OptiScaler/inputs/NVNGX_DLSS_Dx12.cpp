@@ -3,6 +3,7 @@
 #include "Config.h"
 
 #include "NVNGX_DLSS.h"
+#include "RetiredFeatures.h"
 #include "NgxFeatureRegistry.h"
 #include "NVNGX_Parameter.h"
 #include "proxies/NVNGX_Proxy.h"
@@ -33,6 +34,13 @@
 
 static ankerl::unordered_dense::map<unsigned int, ContextData<IFeature_Dx12>> Dx12Contexts;
 static NgxFeatureRegistry HandleToFeature;
+// Released features wait here until no present can still be reading them (RetiredFeatures.h)
+static RetiredFeatures<IFeature_Dx12> RetiredDx12Features;
+
+static void CollectRetiredDx12Features(bool all = false)
+{
+    RetiredDx12Features.Collect(State::Instance().frameCount, Util::MillisecondsNow(), all);
+}
 
 static ID3D12Device* D3D12Device = nullptr;
 static int evalCounter = 0;
@@ -405,6 +413,9 @@ static NVSDK_NGX_Result ShutdownDx12(ID3D12Device* requestedDevice)
     D3D12Device = nullptr;
 
     State::Instance().currentFeature = nullptr;
+
+    // Released features still waiting go now, while the runtime they release into is still up
+    CollectRetiredDx12Features(true);
 
     if (requestedDevice && State::Instance().activeFgNvngx != FGNvngxReplacement::None)
     {
@@ -794,6 +805,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsComma
 {
     LOG_FUNC();
 
+    CollectRetiredDx12Features();
+
     if (!InCmdList)
     {
         LOG_ERROR("InCmdList is null");
@@ -869,6 +882,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_ReleaseFeature(NVSDK_NGX_Handle* 
 
     LOG_FUNC();
 
+    CollectRetiredDx12Features();
+
     if (!InHandle)
         return NVSDK_NGX_Result_Success;
 
@@ -943,7 +958,9 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_ReleaseFeature(NVSDK_NGX_Handle* 
             if (deviceContext == State::Instance().currentFeature)
                 State::Instance().currentFeature = nullptr;
 
-            // Erase from map (smart pointer reset is implicit on erase)
+            // Not destroyed here: a present on another thread may have read currentFeature a moment ago and still be
+            // drawing from it (FPS overlay, menu). It waits a few presents (RetiredFeatures.h).
+            RetiredDx12Features.Park(std::move(entry.feature), State::Instance().frameCount, Util::MillisecondsNow());
             Dx12Contexts.erase(it);
         }
 
@@ -1189,6 +1206,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
                                                                NVSDK_NGX_Parameter* InParameters,
                                                                PFN_NVSDK_NGX_ProgressCallback InCallback)
 {
+    CollectRetiredDx12Features();
+
     if (!InFeatureHandle)
     {
         LOG_DEBUG("InFeatureHandle is null");
