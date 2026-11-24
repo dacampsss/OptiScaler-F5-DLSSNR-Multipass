@@ -247,6 +247,9 @@ class InputCommon
     // What lowers latency for the menu and the logs: InputCommon's output (None without one)
     static LowLatencyMode current_mode();
     static bool low_latency_active();
+    // The game turned its own Reflex off (native::xefgreflex::GameTurnedLowLatencyOff, from the mode it set through
+    // InputCommon): XeFG's XeLL follows it, OptiScaler's limiter keeps the cap, the menu says so. Any thread.
+    static bool game_turned_low_latency_off();
     // The output's latency report (the driver's for Reflex, `estimated` false; the inputs' markers for the others)
     static NvAPI_Status output_latency(NV_LATENCY_RESULT_PARAMS* params, bool* estimated);
     // OptiScaler's FSR FG presents a frame (fakenvapi::reportFGPresent): the output knows frame generation runs and,

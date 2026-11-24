@@ -9,6 +9,7 @@
 enum DlssNrDetailReuseMode : uint32_t
 {
     DlssNrDetailReuse_Capture = 0,    // [work]   t0 input, t1 answer, t2 depth guide -> u0 detail, u1 colour + depth
+                                      //          (CarryTrust: t3 how much of the detail is real -> its validity)
     DlssNrDetailReuse_Reproject = 1,  // [work]   t0 input, t1 detail, t2 colour + depth, t3 motion, t4 depth guide,
                                       //          t5 history distrust (HistoryDistrust) -> u0 answer = input + moved
                                       //          detail * trust
@@ -79,6 +80,10 @@ struct alignas(256) DlssNrDetailReuseConstants
     // (DlssNrFrameInfo::HistoryDistrust; Optical F5Low's trust mask on native input), which scales the moved detail's
     // trust. 0: none, and t5 is a stand-in that is not read.
     uint32_t HistoryDistrust;
+    // A reused frame that another reused frame may follow (every 3rd frame). Reproject / Fill: also write to u1 how
+    // much of each pixel's detail is real (its trust plus what Fill put in). Capture: t3 holds that, and it is saved
+    // as the detail's validity, so the next reused frame does not move "no detail" on as if it were detail.
+    uint32_t CarryTrust;
 };
 static_assert(sizeof(DlssNrDetailReuseConstants) == 256);
 

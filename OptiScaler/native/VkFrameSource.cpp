@@ -5,6 +5,7 @@
 #include "VkDeviceRules.h"
 
 #include <dlssnr/DlssNr_ExposureScan_Vk.h>
+#include <dlssnr/DlssNr_FinishedVk.h>
 #include <resource_tracking/GenericDepth_Vk.h>
 
 #include <Config.h>
@@ -145,6 +146,12 @@ VkPhysicalDevice VkFrameSource::PhysicalDeviceOf(VkDevice device)
     return g_devices.PhysicalOf(device);
 }
 
+std::vector<uint32_t> VkFrameSource::FamiliesOf(VkDevice device)
+{
+    std::lock_guard lock(g_registryMutex);
+    return g_devices.FamiliesOf(device);
+}
+
 VkImageUsageFlags VkFrameSource::SwapchainUsage(VkPhysicalDevice physical, const VkSwapchainCreateInfoKHR& info)
 {
     constexpr VkImageUsageFlags kCopies = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -182,6 +189,19 @@ bool VkFrameSource::SwapchainExtent(VkSwapchainKHR swapchain, uint32_t* width, u
 
     *width = it->second.extent.width;
     *height = it->second.extent.height;
+    return true;
+}
+
+bool VkFrameSource::SwapchainFormat(VkSwapchainKHR swapchain, VkFormat* format, VkColorSpaceKHR* space)
+{
+    std::lock_guard lock(g_registryMutex);
+    const auto it = g_swapchains.find(swapchain);
+
+    if (it == g_swapchains.end())
+        return false;
+
+    *format = it->second.format;
+    *space = it->second.space;
     return true;
 }
 
@@ -439,6 +459,7 @@ void VkFrameSource::Release()
         _device = _interop.device;
         ReleaseRing();
         ReleaseDepth();
+        ReleaseGuides();
         _picture.Reset();
         _fence.Reset();
         _device = current;
@@ -521,6 +542,75 @@ void VkFrameSource::Skip()
     _producerDone = SyncPoint {};
 }
 
+void VkFrameSource::SetGameGuides(const DlssNr::FinishedVk::Guides* guides)
+{
+    _haveGuides = guides != nullptr;
+
+    if (guides != nullptr)
+        _guides = *guides;
+}
+
+void VkFrameSource::ReleaseGuides()
+{
+    // The D3D12 side may still read them, and Vulkan may still copy into them
+    WaitRingIdle();
+    _guideDepth.Reset();
+    _guideMotion.Reset();
+}
+
+void VkFrameSource::TrimGuides(uint64_t presentCount)
+{
+    constexpr uint64_t kIdlePresents = 120;
+
+    if ((_guideDepth.Image() == VK_NULL_HANDLE && _guideMotion.Image() == VK_NULL_HANDLE) || _haveGuides ||
+        _device == VK_NULL_HANDLE || presentCount < _guidesUsedAt || presentCount - _guidesUsedAt <= kIdlePresents)
+        return;
+
+    ReleaseGuides();
+    LOG_INFO("Native motion (Vulkan): the game's guides are not used any more, the shared guide images are released");
+}
+
+bool VkFrameSource::RecordGuides(VkCommandBuffer copyIn, uint32_t family)
+{
+    const auto& g = _guides;
+
+    const auto share =
+        [&](SharedImageVk& shared, uint32_t width, uint32_t height, DXGI_FORMAT dxgi, VkFormat vk, const char* what)
+    {
+        if (shared.Matches(width, height, vk))
+            return true;
+
+        // The D3D12 side may still read the old one, and the last copy in is still queued
+        WaitRingIdle();
+
+        if (!shared.Create(_device12, _interop, width, height, dxgi, vk, false))
+        {
+            _error = std::format("the game's {} could not be shared ({})", what, shared.Error());
+            return false;
+        }
+
+        LOG_INFO("Native motion (Vulkan): sharing the game's {} at {}x{}", what, width, height);
+        return true;
+    };
+
+    if (g.motion == VK_NULL_HANDLE ||
+        !share(_guideMotion, g.motionWidth, g.motionHeight, DXGI_FORMAT_R16G16B16A16_FLOAT,
+               VK_FORMAT_R16G16B16A16_SFLOAT, "motion vectors"))
+        return false;
+
+    if (g.depth != VK_NULL_HANDLE &&
+        !share(_guideDepth, g.depthWidth, g.depthHeight, DXGI_FORMAT_R32_FLOAT, VK_FORMAT_R32_SFLOAT, "depth"))
+        return false;
+
+    // The ring images rest in GENERAL (DlssNr_FinishedVk.cpp); the copies read them there and leave them there
+    RecordCopyToShared(copyIn, g.motion, VK_IMAGE_LAYOUT_GENERAL, _guideMotion, family);
+
+    if (g.depth != VK_NULL_HANDLE)
+        RecordCopyToShared(copyIn, g.depth, VK_IMAGE_LAYOUT_GENERAL, _guideDepth, family);
+
+    return true;
+}
+
 AcquireStatus VkFrameSource::Acquire(FrameInput& input)
 {
     _acquired = false;
@@ -532,8 +622,10 @@ AcquireStatus VkFrameSource::Acquire(FrameInput& input)
     if (_device == VK_NULL_HANDLE || _queue == VK_NULL_HANDLE || _swapchain == VK_NULL_HANDLE)
         return AcquireStatus::Unavailable;
 
-    // Bridged, the picture is copied in all the same: the D3D12 swapchain presents it, producer or not.
-    const bool waiting = GameUpscalerCalledRecently();
+    // Bridged, the picture is copied in all the same: the D3D12 swapchain presents it, producer or not. With the game's
+    // own guides (Finished Picture) the game's upscaler call is what the frame is made from, not a reason to stand
+    // aside.
+    const bool waiting = !_haveGuides && GameUpscalerCalledRecently();
 
     if (waiting && !_bridged)
         return AcquireStatus::WaitingForUpscaler;
@@ -581,7 +673,12 @@ AcquireStatus VkFrameSource::Acquire(FrameInput& input)
 
     if (!VkSharedPictureFormat(format, &dxgiFormat, &sharedFormat))
     {
-        _error = std::format("the swapchain's format ({}) is not one Optical F5Low takes", (int) format);
+        // The game's guides mean Finished Picture, whose status line names the Vulkan format (A2R10G10B10, the common
+        // HDR10 format, is not shared: a raw copy would swap red and blue, and swapping needs a blit, which a compute
+        // present queue cannot do)
+        _error = _haveGuides ? std::format("This screen colour format is not supported (Vulkan {}).",
+                                           DlssNr::FinishedVk::FormatName(format))
+                             : std::format("the swapchain's format ({}) is not one Optical F5Low takes", (int) format);
         return AcquireStatus::Unavailable;
     }
 
@@ -629,7 +726,15 @@ AcquireStatus VkFrameSource::Acquire(FrameInput& input)
     vkBeginCommandBuffer(slot.copyIn, &begin);
     RecordCopyToShared(slot.copyIn, image, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, _picture, family);
     FrameInput depth;
-    const bool haveDepth = !waiting && RecordDepth(slot.copyIn, family, depth);
+    bool guidesRecorded = false;
+
+    if (_haveGuides)
+    {
+        guidesRecorded = RecordGuides(slot.copyIn, family);
+        _guidesUsedAt = PresentCount();
+    }
+
+    const bool haveDepth = !waiting && !_haveGuides && RecordDepth(slot.copyIn, family, depth);
     // The exposure scan's values, on the game's queue (NR runs on D3D12 here, whose pass writes the frame's bookkeeping)
     DlssNr::ExposureScanVk::Record(slot.copyIn, _device, _physical, true);
     vkEndCommandBuffer(slot.copyIn);
@@ -704,6 +809,14 @@ AcquireStatus VkFrameSource::Acquire(FrameInput& input)
     input.depthReadability = GenericDepthVk::NotReadableReason() != nullptr ? DepthReadability::NotReadable
                              : GenericDepthVk::Installed()                  ? DepthReadability::Readable
                                                                             : DepthReadability::Unknown;
+
+    if (_haveGuides && guidesRecorded)
+    {
+        input.hasGameGuides = true;
+        input.game.frame = _guides.frame;
+        input.game.motion = _guideMotion.Res12();
+        input.game.depth = _guides.depth != VK_NULL_HANDLE && _guides.frame.hasDepth ? _guideDepth.Res12() : nullptr;
+    }
 
     if (haveDepth)
     {

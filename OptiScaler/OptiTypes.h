@@ -29,6 +29,9 @@ inline constexpr CString FSR_ViewSpaceToMetersFactor = "FSR.viewSpaceToMetersFac
 inline constexpr CString FSR_TransparencyAndComp = "FSR.transparencyAndComposition";
 inline constexpr CString FSR_Reactive = "FSR.reactive";
 
+// D3D12_RESOURCE_STATES the depth input is in, 0 when unknown
+inline constexpr CString DepthState = "OptiScaler.DepthState";
+
 } // namespace OptiKeys
 
 typedef enum API
@@ -250,6 +253,13 @@ std::string ApiUpscalerInputName(ApiUpscalerInput upscaler);
 std::string UpscalerDisplayName(Upscaler upscaler, API api = API::NotSelected);
 std::string UpscalerShortName(Upscaler upscaler);
 bool IsFsr(Upscaler upscaler);
+
+// Native DX12 and Vulkan upscalers that can take the game's ray reconstruction in place of DLSSD
+inline bool IsRRRegularUpscaler(Upscaler upscaler)
+{
+    return upscaler == Upscaler::XeSS || upscaler == Upscaler::FSR21 || upscaler == Upscaler::FSR22 ||
+           upscaler == Upscaler::FFX || upscaler == Upscaler::DLSS;
+}
 
 // Converts enum to the string codes for config
 std::string UpscalerToCode(Upscaler upscaler);

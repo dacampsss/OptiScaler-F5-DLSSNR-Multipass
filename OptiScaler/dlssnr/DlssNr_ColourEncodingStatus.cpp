@@ -49,6 +49,9 @@ ColourEncodingStatus ReadColourEncodingStatus()
     {
         status.line = DlssNrColourEncoding::Describe(g_choice, g_format);
         status.warning = DlssNrColourEncoding::MismatchWarning(g_choice);
+        // Only for Auto: a forced choice is not what Auto would pick.
+        if (g_choice.automatic)
+            status.inUse = DlssNrColourEncoding::Name(g_choice.encoding);
         status.exposureState = DlssNrExposureState::For(g_choice, g_finishedPicture);
         status.gammaConverted = g_choice.encoding == DlssNrColourEncoding::Encoding::Gamma22;
     }

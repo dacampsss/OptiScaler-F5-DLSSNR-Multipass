@@ -16,9 +16,11 @@ on:
       - 'tests/nr_guides_smoke.cpp'
       - 'tests/nr_surface_formats_smoke.cpp'
       - 'tests/nr_contexts_smoke.cpp'
+      - 'tests/nr_superior_vk_rule_smoke.cpp'
       - 'OptiScaler/shaders/dlssnr/DlssNr_Contexts.h'
       - 'tests/test_nr_superior_scaling.py'
       - 'tools/compile_nr_interpass.ps1'
+      - 'tools/compile_superior_vk.ps1'
       - 'tools/test_superior_port.ps1'
       - 'docs/superior-v59-shaders.json'
       - '.github/workflows/superior_checks.yml'
@@ -33,9 +35,11 @@ on:
       - 'tests/nr_guides_smoke.cpp'
       - 'tests/nr_surface_formats_smoke.cpp'
       - 'tests/nr_contexts_smoke.cpp'
+      - 'tests/nr_superior_vk_rule_smoke.cpp'
       - 'OptiScaler/shaders/dlssnr/DlssNr_Contexts.h'
       - 'tests/test_nr_superior_scaling.py'
       - 'tools/compile_nr_interpass.ps1'
+      - 'tools/compile_superior_vk.ps1'
       - 'tools/test_superior_port.ps1'
       - 'docs/superior-v59-shaders.json'
       - '.github/workflows/superior_checks.yml'
@@ -65,6 +69,12 @@ jobs:
           Write-Error 'Committed Superior blobs differ from a rebuild: run tools/compile_nr_interpass.ps1 and commit the result.'
           exit 1
         }
+
+    - name: Rebuild the Vulkan Superior blobs byte for byte
+      shell: powershell
+      run: |
+        ./tools/compile_superior_vk.ps1 -Check
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     - name: v59 identity, constant ABI and embedded bytecode
       run: python tests/test_nr_superior_scaling.py

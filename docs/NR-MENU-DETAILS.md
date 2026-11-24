@@ -180,6 +180,15 @@ Before Super Resolution: apply NR to the smaller pre-upscale image instead. No e
 
 Finished Picture: apply NR after the game has finished its lighting and effects, which may help with green noise. Works with frame generation on or off in native DirectX 12 games (SDR, HDR10, scRGB), and can also change the HUD and menus.
 
+Finished Picture also runs on native Vulkan games that call DLSS, with the same look and the same colour handling as on DirectX 12. At the game's DLSS call OptiScaler keeps the game's depth and motion vectors; at present the finished picture is shared with a private DirectX 12 device, NR runs there, and the result is copied back (no blit, so it also works when the game presents from a compute queue). The native Vulkan NR model is not built while Finished Picture is on, so the Vulkan-only NR controls give way to the ones that apply. On Vulkan:
+
+- Frame generation must be off (OptiScaler's own or the game's DLSS-G): the menu says so and the picture is left as the game made it.
+- It does not run through dxvk, nor on the Vulkan frame generation bridge.
+- "Run the model before Super Resolution" and "Generate before SR" are not available (the status line says so).
+- Screens in B8G8R8A8, R8G8B8A8 (UNORM or sRGB), A2B10G10R10 and RGBA16F work, in sRGB, HDR10 (ST 2084) and scRGB. A2R10G10B10, HLG, Display P3 and other colour spaces are refused and named in the status line.
+- The game's upscaler output must be the screen's size.
+- When Finished Picture is off for about ten seconds the private DirectX 12 pass and its model are released; the first frame after switching it on again rebuilds them.
+
 ## Reuse bottleneck
 
 Recomputes the model's coarsest stage (its 32x18 bottleneck) only every other frame and reuses the last result in between, which saves roughly a tenth of the model's GPU time.
@@ -256,7 +265,7 @@ That output already reconstructed detail at that ratio, so NR running at the sam
 
 Superior Scaling uses Area downsampling, frequency shaping and guided reconstruction of the NR edit. The **DLSS to temporally stabilize NR** menu offers **No DLSS**, **CNN (recommended)** and **Transformer**. CNN uses D in motion and switches to resident E in still scenes at reduced model resolution. At higher model resolution it uses E under the existing guided range rule. On surfaces that were just uncovered, both CNN and Transformer are told to drop their history; Transformer also repairs any ghost left in its output. The installed DLSS runtime must support the requested presets.
 
-It needs DirectX 12 (or a DirectX 12 bridge); on Vulkan Matched residual runs instead and the menu says so. CNN and Transformer also need the game's depth (on frames without it Superior runs like **No DLSS**) and NVIDIA DLSS through NGX. Without it (a non-NVIDIA card, the vendor-neutral port, a DLSS version or driver too old to give DLSS SR) Superior Scaling still runs, like **No DLSS**, the DLSS choice is greyed out and the menu says why; select Superior Scaling again to retry. Upscale Method has no effect with it. Details: [Superior-Scaling-port.md](Superior-Scaling-port.md).
+It works on DirectX 12 (or a DirectX 12 bridge) and on native Vulkan. On native Vulkan it runs below 100% Model resolution with **No DLSS**, **CNN** or **Transformer**, and at 100% and above with **CNN** or **Transformer** under **Also at 100% and above** (as on DirectX 12), in one NR pass and without Compress screen edges or Reuse detail (Reuse detail only while it actually runs); the CNN there picks D or E and switches in still scenes as on DirectX 12. Where it cannot run on Vulkan, Matched residual runs instead and the menu says why. CNN and Transformer also need the game's depth (on frames without it Superior runs like **No DLSS**) and NVIDIA DLSS through NGX. Without it (a non-NVIDIA card, the vendor-neutral port, a DLSS version or driver too old to give DLSS SR) Superior Scaling still runs, like **No DLSS**, the DLSS choice is greyed out and the menu says why; select Superior Scaling again to retry. Upscale Method has no effect with it. Details: [Superior-Scaling-port.md](Superior-Scaling-port.md).
 
 ## Final Image Composition
 

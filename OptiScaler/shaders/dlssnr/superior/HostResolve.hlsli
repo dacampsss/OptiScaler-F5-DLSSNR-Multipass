@@ -1,6 +1,10 @@
 // v59's radius-one estimator, folded into janblade's existing final composition.
 // t0: working proxy, t1: decoded signed DLSS residual (or raw NR with GuideHeight=1), t5: Low64 field.
 // No exposure, colour encoding or tone-mapping logic belongs in this include.
+#if defined(VK_MODE)
+// Binding 8 is the live shader's depth fade slot; the Superior resolve leaves the fade out and uses it for the low field.
+[[vk::binding(8, 0)]]
+#endif
 Texture2D<float4> gSuperiorLow : register(t5);
 #if defined(DLSSNR_SUPERIOR_HOST_PACKED)
 #include "WarpMap.hlsli"

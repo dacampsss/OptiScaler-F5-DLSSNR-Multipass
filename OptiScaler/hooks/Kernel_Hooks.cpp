@@ -15,6 +15,7 @@
 #include <fsr4/FSR4DriverProviderDx12.h>
 
 #include "Hook_Utils.h"
+#include <misc/GpuMemory.h>
 #include <proxies/XeLL_Proxy.h>
 
 #include "Amdxc64_Hooks.h"
@@ -468,6 +469,9 @@ VOID WINAPI KernelHooks::hk_K32_ExitProcess(UINT uExitCode)
         o_K32_ExitProcess(uExitCode);
         return;
     }
+
+    // The totals of the GPU memory log, while the log still works
+    GpuMemory::LogFinal();
 
     // Other threads (the log's writer) are stopped by ExitProcess and the loader's detach is skipped for it: this is
     // the last chance for the queued log lines to reach the disk. Bounded.

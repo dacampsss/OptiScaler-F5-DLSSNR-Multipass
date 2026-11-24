@@ -58,6 +58,11 @@ OwnedImage prevMotion[2];
 unsigned int savedMotion = 0;
 OwnedImage shownDetail; // work size, RGBA16F: the detail a spread frame showed, for the spread's next frame to move
 bool shownValid = false;
+// work size, R16F, every 3rd frame only: how much of a reused frame's detail is real (trusted or filled), from its
+// Fill or Reproject to its Capture, which saves it as the detail's validity (carried trust, dlssnr_detail_reuse.hlsl)
+OwnedImage carried;
+bool carriedWritten = false; // by this frame's reuse pass
+bool carriedFailed = false;  // its own allocation failure: not host.AllocationFailed, which also turns off Fill
 OwnedImage composed;   // the motion image's size, RG32F: raw vectors over two frames
 OwnedImage estimate;   // work size, RGBA16F: moved detail with its trust (Fill and Steady)
 OwnedImage steadied;   // work size, the answers' format: the steadied answer (Steady)
@@ -259,6 +264,8 @@ void RetireAll()
     Retire(prevMotion[0]);
     Retire(prevMotion[1]);
     savedMotion = 0;
+    Retire(carried);
+    carriedWritten = false;
     Retire(shownDetail);
     shownValid = false;
     Retire(composed);
@@ -347,6 +354,20 @@ bool Prepare(const Frame& f, bool wanted, bool keep, float steady, float fill, b
         Retire(prevMotion[1]);
         savedMotion = 0;
         host.cadence.Drop(); // what was saved may have been in the one just retired
+    }
+    // Carried trust, every 3rd frame only. Without it the reused frames save their detail as before.
+    if (interval >= 3 && prevMotion[1].Valid() && !carried.Valid() && !carriedFailed)
+    {
+        if (!CreateImage(carried, f.workWidth, f.workHeight, VK_FORMAT_R16_SFLOAT, false))
+        {
+            carriedFailed = true;
+            LOG_WARN("DLSS-NR Vulkan detail reuse: could not allocate the carried trust image; reused frames save "
+                     "their detail without it");
+        }
+    }
+    else if (interval < 3 && carried.Valid())
+    {
+        Retire(carried);
     }
 
     // The composed vectors go to the model in the motion subrect's place, so they are sized like the motion image: a
@@ -565,7 +586,7 @@ void MeasureCoverage(const Frame& f)
 // read off how much of the frame had no detail to move, while the estimate is readable anyway. moved: the detail to
 // move, last frame's saved detail by default (the spread moves what it showed; the colour is last frame's either way).
 bool EstimateThen(const Frame& f, DlssNrDetailReuseMode mode, OwnedImage* second, OwnedImage* target, bool measure,
-                  OwnedImage* moved = nullptr)
+                  OwnedImage* moved = nullptr, OwnedImage* carry = nullptr)
 {
     {
         const DlssNrDetailReuse_Vk::Read reads[DlssNrDetailReuse_Vk::kReads] = {
@@ -580,7 +601,11 @@ bool EstimateThen(const Frame& f, DlssNrDetailReuseMode mode, OwnedImage* second
     const DlssNrDetailReuse_Vk::Read reads[DlssNrDetailReuse_Vk::kReads] = {
         Own(f, f.modelInput), Own(f, second), Own(f, &estimate), {}, GameDepth(f)
     };
-    return Run(f, mode, f.workWidth, f.workHeight, reads, target, nullptr);
+    // carry (Fill): also how much of each pixel's detail is real
+    host.params.CarryTrust = carry != nullptr ? 1u : 0u;
+    const bool ok = Run(f, mode, f.workWidth, f.workHeight, reads, target, carry);
+    host.params.CarryTrust = 0;
+    return ok;
 }
 
 // A full frame while reuse is paused: nothing is reused, but the measurement carries on so the guard sees the picture
@@ -640,12 +665,14 @@ Plan BeforeModel(const Frame& f)
     host.Decide(f, plan.active, want);
     const auto& decision = host.decision;
 
+    carriedWritten = false;
+    OwnedImage* const carry = carried.Valid() ? &carried : nullptr;
     if (decision.kind == DlssNrDetailReuse::Kind::Reuse)
     {
         if (want.fill > 0.0f && estimate.Valid())
         {
             // Moved detail with its trust first; Fill composes it and fills where it was dropped.
-            plan.reused = EstimateThen(f, DlssNrDetailReuse_Fill, &estimate, f.output, want.measure);
+            plan.reused = EstimateThen(f, DlssNrDetailReuse_Fill, &estimate, f.output, want.measure, nullptr, carry);
         }
         else
         {
@@ -657,8 +684,11 @@ Plan BeforeModel(const Frame& f)
             const DlssNrDetailReuse_Vk::Read reads[DlssNrDetailReuse_Vk::kReads] = {
                 Own(f, f.modelInput), Own(f, &detail[cur]), Own(f, &colourDepth[cur]), Game(f.motion), GameDepth(f)
             };
-            plan.reused = Run(f, DlssNrDetailReuse_Reproject, f.workWidth, f.workHeight, reads, f.output, nullptr);
+            host.params.CarryTrust = carry != nullptr ? 1u : 0u;
+            plan.reused = Run(f, DlssNrDetailReuse_Reproject, f.workWidth, f.workHeight, reads, f.output, carry);
+            host.params.CarryTrust = 0;
         }
+        carriedWritten = plan.reused && carry != nullptr;
 
         if (plan.reused)
         {
@@ -774,11 +804,16 @@ void AfterModel(const Frame& f, const Plan& plan, bool succeeded, OwnedImage*& f
             !(plan.reused && host.params.DebugView != 0))
         {
             const unsigned int write = 1u - cur;
+            // A reused frame saves how much of its detail is real as the detail's validity (carried trust)
+            const bool carry = plan.reused && carriedWritten && carried.Valid();
             const DlssNrDetailReuse_Vk::Read reads[DlssNrDetailReuse_Vk::kReads] = {
-                Own(f, f.modelInput), Own(f, finalAnswer), GameDepth(f), {}, {}
+                Own(f, f.modelInput), Own(f, finalAnswer), GameDepth(f),
+                carry ? Own(f, &carried) : DlssNrDetailReuse_Vk::Read {}, {}
             };
+            host.params.CarryTrust = carry ? 1u : 0u;
             captured = Run(f, DlssNrDetailReuse_Capture, f.workWidth, f.workHeight, reads, &detail[write],
                            &colourDepth[write]);
+            host.params.CarryTrust = 0;
             if (captured)
                 cur = write;
         }
@@ -813,7 +848,7 @@ void Release(bool deviceAlive)
 {
     OwnedImage* const images[] = { &detail[0], &detail[1], &colourDepth[0], &colourDepth[1], &prevMotion[0],
                                    &prevMotion[1], &shownDetail, &composed, &estimate, &steadied, &depthOnly,
-                                   &coverage };
+                                   &coverage,       &carried };
     for (OwnedImage* img : images)
     {
         if (deviceAlive)
@@ -845,6 +880,8 @@ void Release(bool deviceAlive)
     cur = 0;
     savedMotion = 0;
     shownValid = false;
+    carriedWritten = false;
+    carriedFailed = false;
     host.Reset();
 }
 } // namespace DetailReuseVk

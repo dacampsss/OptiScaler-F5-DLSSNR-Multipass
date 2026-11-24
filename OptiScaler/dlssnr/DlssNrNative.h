@@ -21,6 +21,8 @@ std::string VitStatus();
 const char* VitKernelSet();
 // True when the last ViT run seen used the plain fp16 kernels.
 bool VitPlainKernels();
+// True once a ViT run has been seen (VitPlainKernels then says which set).
+bool VitKernelsSeen();
 // Vulkan (DlssNrNative_Vk.cpp): the model's VK_NVX_binary_import calls, from the Vulkan hook table
 // (VulkanwDx12_Hooks.cpp), so Reuse bottleneck and the kernel set work there too. `function` is a VkCuFunctionNVX,
 // `commandBuffer` a VkCommandBuffer.

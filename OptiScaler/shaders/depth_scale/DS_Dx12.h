@@ -7,7 +7,8 @@
 #include <shaders/Shader_Dx12Utils.h>
 #include <shaders/Shader_Dx12.h>
 
-#define DS_NUM_OF_HEAPS 2
+// The scene depth copy for XeSS in Unreal Engine games (inputs/XeSS_UE_Dx12.cpp) keeps one copy list per heap in flight
+#define DS_NUM_OF_HEAPS 8
 
 class DS_Dx12 : public Shader_Dx12
 {
@@ -25,6 +26,11 @@ class DS_Dx12 : public Shader_Dx12
                               D3D12_RESOURCE_STATES InState);
     void SetBufferState(ID3D12GraphicsCommandList* InCommandList, D3D12_RESOURCE_STATES InState);
     bool Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InResource, ID3D12Resource* OutResource);
+
+    // Divides InResource by InDepthScale into OutResource over InWidth x InHeight pixels. Every dispatch of an instance
+    // writes the same constants buffer, so an instance keeps to one depth scale.
+    bool Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InResource, ID3D12Resource* OutResource,
+                  float InDepthScale, UINT InWidth, UINT InHeight);
 
     ID3D12Resource* Buffer() { return _buffer; }
     bool CanRender() const { return _init && _buffer != nullptr; }

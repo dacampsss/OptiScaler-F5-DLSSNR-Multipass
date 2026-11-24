@@ -13,6 +13,15 @@
 // Trust fades smoothly rather than switching, and full frames can be pulled toward the moved detail (Steady), so
 // frames next to each other differ less.
 //
+// Carried trust (carryTrust, every 3rd frame): a reused frame's saved detail is input + moved detail * trust (+ fill),
+// minus input, so where nothing was trusted and nothing could be filled it is no detail at all -- and saved as valid,
+// the next reused frame moved that nothing on with full trust: what a fast body uncovered deeper than Fill reaches
+// stayed the game's own picture for a second frame, a patch trailing the body. So a reused frame also writes how much
+// of each pixel's detail is real (its trust plus what Fill put in; Reproject / Fill -> u1), Capture saves that as the
+// detail's validity (t3), and a moved sample is trusted no further than the validity it was read from. The next
+// reused frame then fills such a pixel again, from neighbours that now include last frame's filled ones. Detail that
+// was fully trusted or fully filled carries a validity of 1 and is moved exactly as before.
+//
 // Separate from dlssnr.hlsl so the shared shader and every ordinary pass stay as they are. It reuses that shader's
 // root signature and descriptor table (t0..t5, u0..u1, b0, s0 = linear clamp) through
 // DlssNr_Dx12::DispatchDetailReuse. On Vulkan (VK_MODE) it has its own pass and descriptor set layout,
@@ -73,6 +82,7 @@ cbuffer Params : register(b0)
     float motionReject;
     float steadyDeadZone;
     uint historyDistrust; // t5 holds an outside opinion of this pixel's history (see OutsideTrust); 0: none
+    uint carryTrust;      // a reused frame another reused frame follows (see the note on carried trust below)
 };
 
 #ifdef VK_MODE
@@ -275,7 +285,8 @@ float4 MovedFrom(float2 previousUv, float2 raw, float depthNow, float3 mean, flo
         depthLo = ok ? min(depthLo, savedDepth) : depthLo;
         depthHi = ok ? max(depthHi, savedDepth) : depthHi;
     }
-    if (valid < 0.999)
+    // Validity is 0 or 1 except on a history a reused frame saved with carried trust (see the header)
+    if (valid <= 0.0)
         return 0.0;
 
     const float3 moved = clamp(SampleCatmullRom(t1, previousUv, work).rgb, detailLo, detailHi);
@@ -300,7 +311,7 @@ float4 MovedFrom(float2 previousUv, float2 raw, float depthNow, float3 mean, flo
         return 0.0;
     const float motionTrust = MotionTrust(previousUv, raw);
     byMotion = 1.0 - motionTrust;
-    return float4(moved, saturate(depthTrust * colourTrust * motionTrust));
+    return float4(moved, saturate(depthTrust * colourTrust * motionTrust * valid));
 }
 
 // How far an outside opinion trusts this pixel's history (DlssNrFrameInfo::HistoryDistrust): t5 holds distrust 0..1 in
@@ -410,7 +421,14 @@ void Capture(uint2 p, bool colourToo)
     const float3 answer = t1.Load(int3(p, 0)).rgb;
     const float3 detail = answer - input.rgb;
     const bool valid = Finite3(detail) && Finite3(input.rgb) && all(abs(detail) <= 65504.0);
-    u0[p] = float4(valid ? detail : 0.0, valid ? 1.0 : 0.0);
+    // Carried trust: t3 holds how much of this (reused) frame's detail is real
+    float real = 1.0;
+    if (carryTrust != 0u)
+    {
+        const float carried = t3.Load(int3(p, 0)).r;
+        real = isfinite(carried) ? saturate(carried) : 0.0;
+    }
+    u0[p] = float4(valid ? detail : 0.0, valid ? real : 0.0);
     if (!colourToo)
         return;
     // No depth this frame: t2 stands in with the colour, so save far (0) instead. A next frame with depth then finds
@@ -433,6 +451,8 @@ void Reproject(uint2 p)
         result.rgb = lerp(lerp(float3(1.0, 0.0, 1.0), float3(1.0, 1.0, 0.0), byMotion), result.rgb, moved.a);
 
     u0[p] = result;
+    if (carryTrust != 0u)
+        u1[p] = float4(saturate(moved.a), 0.0, 0.0, 0.0);
 }
 
 void Steady(uint2 p)
@@ -529,6 +549,9 @@ void Fill(uint2 p)
         result = result * trust + float3(0.0, 1.0, 1.0) * filled + float3(1.0, 0.0, 1.0) * max(1.0 - trust - filled, 0.0);
 
     u0[p] = float4(result, input.a);
+    // Carried trust: what was trusted plus what was filled; the rest of this pixel has no detail
+    if (carryTrust != 0u)
+        u1[p] = float4(saturate(trust + filled), 0.0, 0.0, 0.0);
 }
 
 // Work size: this frame's vectors as a uv displacement, so the next frame reads them right after a render-size change.

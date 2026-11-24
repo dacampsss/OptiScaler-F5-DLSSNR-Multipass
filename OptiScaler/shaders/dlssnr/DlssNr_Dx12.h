@@ -132,6 +132,11 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
     // failed to build.
     ID3D12PipelineState* _detailReusePipelineState = nullptr;
     bool _detailReusePipelineFailed = false;
+
+    // The smooth canvas input style's tiled build of dlssnr.hlsl (DLSSNR_SMOOTH_CANVAS_TILED, 16x16 groups), built on
+    // first use the same way. Without it the style runs in the main shader (mode 16): the same picture, slower.
+    ID3D12PipelineState* _smoothCanvasPipelineState = nullptr;
+    bool _smoothCanvasPipelineFailed = false;
     ID3D12PipelineState* _editCachePipelineState = nullptr;
     bool _editCachePipelineFailed = false;
 
@@ -222,7 +227,8 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
 
     // Records one pass. Resources that a given mode does not read may be null; a stand-in is bound in
     // their place so every descriptor in the table is valid.
-    // One compute pass. The public entry below drives three of these plus the model.
+    // One compute pass. The public entry below drives three of these plus the model. Dispatched in 8x8 groups (the
+    // main shader's), or 16x16 when overridePipeline is SmoothCanvasPipeline() (the tiled smooth canvas).
     bool DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssNrConstants& InConstants,
                   ID3D12Resource* InSource, ID3D12Resource* InModel, ID3D12Resource* InOriginal,
                   ID3D12Resource* InMotion,
@@ -272,6 +278,10 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
     // x Height threads. InHistoryDistrust is t5 (DlssNrDetailReuseConstants::HistoryDistrust), read by Reproject and
     // Estimate only.
     bool DetailReuseReady();
+
+    // The tiled smooth canvas pipeline (nullptr when it could not be built). DispatchPass with it as the override
+    // dispatches 16x16 groups.
+    ID3D12PipelineState* SmoothCanvasPipeline();
     bool DispatchDetailReuse(ID3D12GraphicsCommandList* InCmdList, const DlssNrDetailReuseConstants& InConstants,
                              unsigned int Width, unsigned int Height, ID3D12Resource* In0, ID3D12Resource* In1,
                              ID3D12Resource* In2, ID3D12Resource* In3, ID3D12Resource* In4, ID3D12Resource* OutTarget,

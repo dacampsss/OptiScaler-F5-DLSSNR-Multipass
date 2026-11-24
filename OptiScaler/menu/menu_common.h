@@ -29,6 +29,9 @@ const ImVec4& CardHeaderActiveColor();
 ImFont* MonoFont(); // Hack; null with a custom TTF or HQ font off
 } // namespace MenuStyle
 
+// A key's name as the Keybinds card shows it ("Unbound" for none), for pages that mention a key next to its action.
+std::string MenuKeyName(int virtualKey);
+
 // Live numbers keep the fixed-width font so digits don't jitter when the default is proportional.
 class ScopedMonoFont
 {
@@ -262,6 +265,8 @@ class MenuCommon
     static void RenderFrameGenerationSelection(RenderMenuContext& ctx);
     static void RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx);
     static void RenderFrameGenerationFooter(RenderMenuContext& ctx);
+    // custom: the custom DLSS-G replacement that would take the preset (empty: NVIDIA's DLSS-G)
+    static void RenderDlssgPresetCombo(RenderMenuContext& ctx, const std::string& custom = "");
     static void RenderFgStatusLine(RenderMenuContext& ctx);
     static void RenderXeFGDynamicMFG(RenderMenuContext& ctx, int maxInterpolationCount, bool followsGame);
     static void RenderFGFollowGame();
@@ -307,6 +312,8 @@ class MenuCommon
     // them.
     static void FGOutputPresent();
     static void FGOutputPresents(bool presents);
+    // What the overlay's output-rate meter has counted (never reset) and whether it is on; for logs
+    static uint64_t FGOutputPresentTotal(bool* enabled);
     static void ApplyThemeStyle();
     static void RebuildStyle(float menuScale = 0.0f);
     static void ApplyThemeFont();

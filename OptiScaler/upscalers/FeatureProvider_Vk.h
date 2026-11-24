@@ -9,8 +9,9 @@
 class FeatureProvider_Vk
 {
   public:
+    // With rayReconstruction the upscaler settings aren't changed and DLSSD can be a custom one
     static bool GetFeature(Upscaler upscaler, UINT handleId, NVSDK_NGX_Parameter* parameters,
-                           std::unique_ptr<IFeature_Vk>* feature);
+                           std::unique_ptr<IFeature_Vk>* feature, bool rayReconstruction = false);
 
     static bool ChangeFeature(Upscaler upscaler, VkInstance instance, VkPhysicalDevice pd, VkDevice device,
                               VkCommandBuffer cmdBuffer, PFN_vkGetInstanceProcAddr gipa, PFN_vkGetDeviceProcAddr gdpa,
@@ -22,6 +23,9 @@ class FeatureProvider_Vk
     // The Vulkan-on-D3D12 backend standing in for `upscaler`: DLSS -> DLSS_on12 where DLSS can run, FSR 2.1 -> its
     // on12, anything else (FSR 2.2, FFX, XeSS: no XeSS on12 for Vulkan yet) -> FFX_on12. An on12 one is kept.
     static Upscaler On12For(Upscaler upscaler);
+    // The Vulkan backend a D3D12 copy stands in for (DLSS_on12 -> DLSS, FFX_on12 -> FFX, FSR21_on12 -> FSR21), so a
+    // route left after a restart can go back; anything else is kept. FFX_on12 also stands in for FSR 2.2 and XeSS: FFX.
+    static Upscaler Off12For(Upscaler upscaler);
     // The backend to build: `upscaler`, or On12For(upscaler) while the Vulkan route is on.
     static Upscaler ForFrameGenerationOnly(Upscaler upscaler);
 };

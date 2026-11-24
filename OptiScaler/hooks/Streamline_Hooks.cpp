@@ -15,6 +15,7 @@
 #include <framegen/nvngx/Nvngx_FG.h>
 #include <framegen/dlssg/DlssgTelemetry.h>
 #include <framegen/f5low/F5Low.h>
+#include <upscalers/nvngx/Nvngx_RR.h>
 #include <proxies/KernelBase_Proxy.h>
 #include <proxies/Streamline_Proxy.h>
 #include <imgui/ImGuiNotify.hpp>
@@ -138,6 +139,20 @@ static bool IsSL1AndDLSSGManaged()
 
     return state.streamlineVersion.major == 1 &&
            (state.activeFgInput == FGInput::DLSSG || state.activeFgOutput == FGOutput::DLSSG);
+}
+
+// OptiScaler makes its own frame generation swapchain (FGHooks, CheckForFGStatus: an FG Input that is not None or
+// NvngxFG, and an FG Output). The game's DLSS-G swapchain hooks would wrap it a second time (Forza Horizon 6, OptiFG +
+// F5Low: Streamline made two frame generation swapchains and crashed in sl.interposer at the first present), so they
+// are cleared as for FG Input DLSSG. D3D12 only: not checked on Vulkan (native Vulkan FG / bridge), and clearing would
+// also zero sl.dlss_g's Vulkan queue requests; there the game's DLSS-G and OptiScaler's FG can still both run.
+// SL1 games are not covered (IsSL1AndDLSSGManaged), untested there
+static bool OwnsFrameGenerationSwapchainD3D12(sl::RenderAPI renderApi)
+{
+    const auto& state = State::Instance();
+
+    return renderApi != sl::RenderAPI::eVulkan && state.activeFgInput != FGInput::NoFG &&
+           state.activeFgInput != FGInput::NvngxFG && state.activeFgOutput != FGOutput::NoFG;
 }
 
 static void PatchSL1PluginJson(nlohmann::json& configJson)
@@ -1025,10 +1040,14 @@ void StreamlineHooks::spoofArch(uint32_t currentArch, sl::Feature feature, Syste
             return setArch(maxArch, altSystemCaps);
     }
 
-    // Don't spoof DLSSD at all
+    // Only spoof DLSSD for a custom one or a regular upscaler, NVIDIA's needs turing and above
     else if (feature == sl::kFeatureDLSS_RR)
     {
-        return;
+        if (!Nvngx_RR::OfferedAny())
+            return;
+
+        if (currentArch < NV_GPU_ARCHITECTURE_TU100)
+            return setArch(maxArch, altSystemCaps);
     }
 
     // Don't change arch for DLSSG with ada and above
@@ -1099,6 +1118,67 @@ bool StreamlineHooks::hkdlss_slOnPluginLoad(sl::param::IParameters* params, cons
     return result;
 }
 
+// A plugin load that succeeded and handed back a non-empty plugin json
+static bool HasPluginJson(bool result, const char** pluginJSON)
+{
+    return result && pluginJSON != nullptr && *pluginJSON != nullptr && **pluginJSON != 0;
+}
+
+// Only hooked when Opti reports ray reconstruction, for a custom DLSSD or a regular upscaler
+bool StreamlineHooks::hkdlssd_slOnPluginLoad(sl::param::IParameters* params, const char* loaderJSON,
+                                             const char** pluginJSON)
+{
+    LOG_FUNC();
+
+    // TODO: do it better than "static" and hoping for the best
+    static std::string config;
+
+    uint32_t currentArch = 0;
+    if (Config::Instance()->StreamlineSpoofing.value_or_default())
+    {
+        hookSystemCaps(params);
+        currentArch = getSystemCapsArch();
+        spoofArch(currentArch, sl::kFeatureDLSS_RR);
+    }
+
+    auto result = o_dlssd_slOnPluginLoad != nullptr && o_dlssd_slOnPluginLoad(params, loaderJSON, pluginJSON);
+
+    if (Config::Instance()->StreamlineSpoofing.value_or_default())
+        setArch(currentArch);
+
+    if (!HasPluginJson(result, pluginJSON))
+        return result;
+
+    nlohmann::json configJson = nlohmann::json::parse(*pluginJSON, nullptr, false);
+    if (configJson.is_discarded())
+    {
+        LOG_ERROR("Failed to parse plugin JSON");
+        return result;
+    }
+
+    auto primaryGpu = IdentifyGpu::getPrimaryGpu();
+    if (primaryGpu.vendorId != VendorId::Nvidia || !primaryGpu.dlssCapable)
+    {
+        if (configJson.contains("/external/vk/instance/extensions"_json_pointer))
+            configJson["external"]["vk"]["instance"]["extensions"].clear();
+
+        if (configJson.contains("/external/vk/device/extensions"_json_pointer))
+            configJson["external"]["vk"]["device"]["extensions"].clear();
+
+        if (configJson.contains("/external/vk/device/1.2_features"_json_pointer))
+            configJson["external"]["vk"]["device"]["1.2_features"].clear();
+
+        if (configJson.contains("/external/vk/device/1.3_features"_json_pointer))
+            configJson["external"]["vk"]["device"]["1.3_features"].clear();
+    }
+
+    config = configJson.dump();
+
+    *pluginJSON = config.c_str();
+
+    return result;
+}
+
 sl::Result StreamlineHooks::hkslDLSSGetOptimalSettings(const sl::DLSSOptions& options,
                                                        sl::DLSSOptimalSettings& settings)
 {
@@ -1154,8 +1234,22 @@ bool StreamlineHooks::hkdlssg_slOnPluginLoad(sl::param::IParameters* params, con
     nlohmann::json configJson = nlohmann::json::parse(*pluginJSON);
 
     // Kill the DLSSG streamline swapchain hooks
-    if (State::Instance().activeFgInput == FGInput::DLSSG || State::Instance().activeFgOutput == FGOutput::DLSSG)
+    const bool ownsFgSwapchain = OwnsFrameGenerationSwapchainD3D12(renderApi);
+    if (State::Instance().activeFgInput == FGInput::DLSSG || State::Instance().activeFgOutput == FGOutput::DLSSG ||
+        ownsFgSwapchain)
     {
+        if (State::Instance().activeFgInput != FGInput::DLSSG)
+            State::Instance().gameDlssgReplacedByOwnFg = true;
+
+        if (ownsFgSwapchain && State::Instance().activeFgInput != FGInput::DLSSG &&
+            State::Instance().activeFgOutput != FGOutput::DLSSG)
+        {
+            LOG_INFO("Game's DLSS-G swapchain hooks cleared: OptiScaler makes the frame generation swapchain (FG Input "
+                     "{}, FG Output {})",
+                     magic_enum::enum_name(State::Instance().activeFgInput),
+                     magic_enum::enum_name(State::Instance().activeFgOutput));
+        }
+
         if (configJson.contains("/hooks"_json_pointer))
             configJson["hooks"].clear();
 
@@ -1388,8 +1482,25 @@ sl::Result StreamlineHooks::hkslDLSSGSetOptions(const sl::ViewportHandle& viewpo
         return o_slDLSSGSetOptions(viewport, newOptions);
     }
 
+    // OptiScaler makes the frame generation swapchain, so its swapchain hooks were cleared at plugin load: OptiScaler's
+    // frame generation replaces the game's (also over KeepGameDlssg). Kept from plugin load, not re-checked, so the
+    // game's DLSS-G stays off without its hooks even if OptiScaler's FG fails to start later. Its resources are freed:
+    // it never comes back this session
+    if (state.activeFgInput != FGInput::DLSSG && state.gameDlssgReplacedByOwnFg)
+    {
+        static std::atomic<bool> loggedReplaced { false };
+        if (!loggedReplaced.exchange(true))
+            LOG_INFO("The game's own DLSS-G is forced off: OptiScaler's frame generation replaces it (FG Input {}, FG "
+                     "Output {})",
+                     magic_enum::enum_name(state.activeFgInput), magic_enum::enum_name(state.activeFgOutput));
+        newOptions.mode = sl::DLSSGMode::eOff;
+        newOptions.flags &= ~sl::DLSSGFlags::eRetainResourcesWhenOff;
+        return o_slDLSSGSetOptions(viewport, newOptions);
+    }
+
     // F5Low's DLSS-G generator: the game's Streamline runs F5Low's nvngx_dlssg (redirect), which f5low patches only
-    // when its own context starts, so the game's DLSS-G stays off (unless FG Input is DLSSG or KeepGameDlssg is set)
+    // when its own context starts, so the game's DLSS-G stays off (unless FG Input is DLSSG or KeepGameDlssg is set).
+    // With an FG Input (OptiFG etc.) the branch above already turned it off; this one covers FG Input None
     if (F5Low::ForcesGameDlssgOff())
     {
         static std::atomic<bool> loggedF5lowOff { false };
@@ -2382,6 +2493,7 @@ static PluginHook g_localDlssgPlugin { "local sl.dlssg", "local DLSSG" };
 static PluginHook g_reflexPlugin { "sl.reflex", "Reflex" };
 static PluginHook g_pclPlugin { "sl.pcl", "PCL" };
 static PluginHook g_commonPlugin { "sl.common", "Common" };
+static PluginHook g_dlssdPlugin { "sl.dlss_d", "DLSSD" };
 
 // Held around each plugin's record and its Detours transaction (taken before g_detoursTransactionMutex, never after).
 // Nothing under it loads a library, waits for the loader or frees a module: a module pinned for a check (PluginPin) is
@@ -2621,6 +2733,38 @@ void StreamlineHooks::hookDlss(HMODULE slDlss)
     HookPlugin(g_dlssPlugin, slDlss, o_dlss_slGetPluginFunction, reinterpret_cast<void*>(hkdlss_slGetPluginFunction));
 }
 
+// SL DLSSD (upstream OptiScaler c2a40331, on our PluginHook records)
+
+void* StreamlineHooks::hkdlssd_slGetPluginFunction(const char* functionName)
+{
+    // The game looked for ray reconstruction (upstream 9e9a7190)
+    State::Instance().rrRequested = true;
+
+    if (strcmp(functionName, "slOnPluginLoad") == 0 && Nvngx_RR::OfferedAny())
+    {
+        o_dlssd_slOnPluginLoad = (PFN_slOnPluginLoad) LoadOriginal(o_dlssd_slGetPluginFunction)(functionName);
+        return &hkdlssd_slOnPluginLoad;
+    }
+
+    return LoadOriginal(o_dlssd_slGetPluginFunction)(functionName);
+}
+
+void StreamlineHooks::hookDlssd(HMODULE slDlssd)
+{
+    if (State::Instance().externalFrameGeneration)
+        return;
+    LOG_FUNC();
+
+    if (!slDlssd)
+    {
+        LOG_WARN("Dlssd module in NULL");
+        return;
+    }
+
+    HookPlugin(g_dlssdPlugin, slDlssd, o_dlssd_slGetPluginFunction,
+               reinterpret_cast<void*>(hkdlssd_slGetPluginFunction));
+}
+
 // SL DLSSG
 
 void StreamlineHooks::hookDlssg(HMODULE slDlssg)
@@ -2730,3 +2874,5 @@ bool StreamlineHooks::isCommonHooked() { return PluginHooked(g_commonPlugin); }
 bool StreamlineHooks::isPclHooked() { return PluginHooked(g_pclPlugin); }
 
 bool StreamlineHooks::isReflexHooked() { return PluginHooked(g_reflexPlugin); }
+
+bool StreamlineHooks::isDlssdHooked() { return PluginHooked(g_dlssdPlugin); }

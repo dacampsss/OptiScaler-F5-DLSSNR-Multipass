@@ -189,9 +189,7 @@ int main() {
             require(PrivatePreset(1, sigma) == (sigma < .01f ? 5u : 4u));
             require(PrivatePreset(11, sigma) == 11u);
             for (unsigned mode : { 0u, 1u, 2u, 11u })
-                for (bool vulkan : { false, true })
-                    require(CanSelectUpscaleMode(mode, percent / 100.f, vulkan) ==
-                            (mode == 11u ? !vulkan : mode == 0u || percent < 100));
+                require(CanSelectUpscaleMode(mode, percent / 100.f) == (mode == 11u || mode == 0u || percent < 100));
             DlssNrConstants resolve {};
             SetGuidedRange(resolve, percent / 100.f);
             float inverse;

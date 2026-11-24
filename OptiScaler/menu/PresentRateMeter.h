@@ -12,7 +12,11 @@
 class PresentRateMeter final
 {
     static constexpr std::size_t Capacity = 512;
-    static constexpr double WindowMs = 125.0;
+    // The readout averages the last WindowPresents output presents, as the D3D12 overlay averages its last 100 drawn
+    // frames (one per shown frame there), so both read the same steady number. The window still starts at an earlier
+    // FrameTime call (whole game frames, see FrameTime); MaxWindowMs bounds it at low rates.
+    static constexpr std::uint64_t WindowPresents = 100;
+    static constexpr double MaxWindowMs = 2000.0;
     static constexpr double MinimumSpanMs = 50.0;
 
     struct Sample
@@ -71,6 +75,16 @@ class PresentRateMeter final
         _lastPresentMs = nowMs;
     }
 
+    // The count of output presents seen while enabled (never reset), and whether it is enabled now; does not touch the
+    // menu's window. For logs that compare the overlay's rate with another count of the same presents.
+    std::uint64_t Total(bool* enabled)
+    {
+        std::lock_guard lock(_mutex);
+        if (enabled != nullptr)
+            *enabled = _enabled;
+        return _presents;
+    }
+
     // Called from the menu thread. Zero means there are not enough recent
     // output presents; the ordinary game-present timing remains the fallback.
     double FrameTime(double nowMs)
@@ -79,7 +93,11 @@ class PresentRateMeter final
         if (!_enabled)
             return 0.0;
 
-        while (!_samples.empty() && nowMs - _samples.front().ms > WindowMs)
+        while (!_samples.empty() && nowMs - _samples.front().ms > MaxWindowMs)
+            _samples.pop_front();
+
+        // Drop older samples while the next one still covers WindowPresents presents
+        while (_samples.size() > 1 && _presents - _samples[1].presents >= WindowPresents)
             _samples.pop_front();
 
         _samples.push_back({ nowMs, _presents });

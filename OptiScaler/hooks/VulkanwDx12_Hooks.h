@@ -40,6 +40,11 @@ class Vulkan_wDx12
                                       VkFence fence);
     static VkResult hk_vkQueueSubmit2KHR(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits,
                                          VkFence fence);
+    static VkResult QueueSubmitInner(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence);
+    static VkResult QueueSubmit2Inner(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits,
+                                      VkFence fence);
+    static VkResult QueueSubmit2KHRInner(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits,
+                                         VkFence fence);
     static VkResult hk_vkBeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* pBeginInfo);
     static VkResult hk_vkEndCommandBuffer(VkCommandBuffer commandBuffer);
     static VkResult hk_vkResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags);

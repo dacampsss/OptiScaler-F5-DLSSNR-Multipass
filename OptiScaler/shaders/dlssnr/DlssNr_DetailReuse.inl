@@ -57,6 +57,12 @@ unsigned int savedMotion = 0;
 // work size, RGBA16F: the detail a spread frame showed (answer - input, a = valid), for the spread's next frame to move
 ID3D12Resource* shownDetail = nullptr;
 bool shownValid = false;
+// work size, R16F, every 3rd frame only: how much of a reused frame's detail is real (trusted or filled), from its
+// Fill or Reproject to its Capture, which saves it as the detail's validity (carried trust, dlssnr_detail_reuse.hlsl).
+// Without it the second reused frame in a row moved "no detail" on as trusted detail.
+ID3D12Resource* carried = nullptr;
+bool carriedWritten = false; // by this frame's reuse pass
+bool carriedFailed = false;  // its own allocation failure: not host.AllocationFailed, which also turns off Fill
 ID3D12Resource* composed = nullptr;   // the motion texture's allocation size: raw vectors over two frames
 ID3D12Resource* estimate = nullptr;   // work size: moved detail with its trust (Fill and Steady)
 ID3D12Resource* steadied = nullptr;   // work size, the answers' format: the steadied answer (Steady)
@@ -285,6 +291,8 @@ void ParkAll()
     ParkNrResource(prevMotion[0]);
     ParkNrResource(prevMotion[1]);
     savedMotion = 0;
+    ParkNrResource(carried);
+    carriedWritten = false;
     ParkNrResource(shownDetail);
     shownValid = false;
     ParkComposed();
@@ -349,6 +357,21 @@ bool Prepare(const Frame& f, bool wanted, bool keep, float steady, float fill, b
         ParkNrResource(prevMotion[1]);
         savedMotion = 0;
         cadence.Drop(); // what was saved may have been in the one just parked
+    }
+    // Carried trust, every 3rd frame only. Without it the reused frames save their detail as before.
+    if (interval >= 3 && prevMotion[1] != nullptr && carried == nullptr && !carriedFailed)
+    {
+        carried = CreateScratch(f.device, DXGI_FORMAT_R16_FLOAT, f.workWidth, f.workHeight);
+        if (carried == nullptr)
+        {
+            carriedFailed = true;
+            LOG_WARN("DLSS-NR detail reuse: could not allocate the carried trust texture; reused frames save their "
+                     "detail without it");
+        }
+    }
+    else if (interval < 3 && carried != nullptr)
+    {
+        ParkNrResource(carried);
     }
 
     // The composed vectors go to the model in the motion subrect's place, so they are sized like the motion texture's
@@ -459,9 +482,9 @@ ID3D12Resource* HistoryDistrust(const Frame& f) { return static_cast<ID3D12Resou
 // The moved detail with its trust into `estimate`, then `mode` (Fill or Steady) from it into `target`. measure: also
 // read off how much of the frame had no detail to move, while the estimate is readable anyway.
 // moved: the detail to move, last frame's saved detail by default (the spread moves what it showed instead; the
-// colour it is tested with is last frame's either way).
+// colour it is tested with is last frame's either way). carry (Fill): also how much of each pixel's detail is real.
 bool EstimateThen(const Frame& f, DlssNrDetailReuseMode mode, ID3D12Resource* second, ID3D12Resource* target,
-                  bool measure, ID3D12Resource* moved = nullptr)
+                  bool measure, ID3D12Resource* moved = nullptr, ID3D12Resource* carry = nullptr)
 {
     if (moved == nullptr)
         moved = detail[cur];
@@ -482,8 +505,10 @@ bool EstimateThen(const Frame& f, DlssNrDetailReuseMode mode, ID3D12Resource* se
     if (measure)
         MeasureCoverage(f);
     params.Mode = mode;
+    params.CarryTrust = carry != nullptr ? 1u : 0u;
     ok = f.pass->DispatchDetailReuse(f.cmdList, params, f.workWidth, f.workHeight, f.modelInput, second, estimate,
-                                     nullptr, f.depth, target, nullptr);
+                                     nullptr, f.depth, target, carry);
+    params.CarryTrust = 0;
     Barrier(f.cmdList, estimate, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     return ok;
 }
@@ -533,12 +558,13 @@ Plan BeforeModel(const Frame& f)
     host.Decide(facts, plan.active, want);
     params.HistoryDistrust = HistoryDistrust(f) != nullptr ? 1u : 0u;
 
+    carriedWritten = false;
     if (decision.kind == DlssNrDetailReuse::Kind::Reuse)
     {
         if (want.fill > 0.0f && estimate != nullptr)
         {
             // Moved detail with its trust first; Fill composes it and fills where it was dropped.
-            plan.reused = EstimateThen(f, DlssNrDetailReuse_Fill, estimate, f.output, want.measure);
+            plan.reused = EstimateThen(f, DlssNrDetailReuse_Fill, estimate, f.output, want.measure, nullptr, carried);
         }
         else
         {
@@ -550,11 +576,14 @@ Plan BeforeModel(const Frame& f)
 
             MakeHistoryReadable(f.cmdList, true);
             params.Mode = DlssNrDetailReuse_Reproject;
+            params.CarryTrust = carried != nullptr ? 1u : 0u;
             plan.reused =
                 f.pass->DispatchDetailReuse(f.cmdList, params, f.workWidth, f.workHeight, f.modelInput, detail[cur],
-                                            colourDepth[cur], f.motion, f.depth, f.output, nullptr, HistoryDistrust(f));
+                                            colourDepth[cur], f.motion, f.depth, f.output, carried, HistoryDistrust(f));
+            params.CarryTrust = 0;
             MakeHistoryReadable(f.cmdList, false);
         }
+        carriedWritten = plan.reused && carried != nullptr;
 
         if (plan.reused)
         {
@@ -688,10 +717,20 @@ void AfterModel(const Frame& f, const Plan& plan, bool succeeded, ID3D12Resource
         if (succeeded && finalAnswer != nullptr && !(plan.reused && params.DebugView != 0))
         {
             const unsigned int write = 1u - cur;
+            // A reused frame saves how much of its detail is real as the detail's validity (carried trust)
+            const bool carry = plan.reused && carriedWritten && carried != nullptr;
+            if (carry)
+                Barrier(f.cmdList, carried, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             params.Mode = DlssNrDetailReuse_Capture;
+            params.CarryTrust = carry ? 1u : 0u;
             captured = f.pass->DispatchDetailReuse(f.cmdList, params, f.workWidth, f.workHeight, f.modelInput,
-                                                   finalAnswer, f.depth, nullptr, nullptr, detail[write],
-                                                   colourDepth[write]);
+                                                   finalAnswer, f.depth, carry ? carried : nullptr, nullptr,
+                                                   detail[write], colourDepth[write]);
+            params.CarryTrust = 0;
+            if (carry)
+                Barrier(f.cmdList, carried, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             if (captured)
                 cur = write;
         }
@@ -731,7 +770,8 @@ DlssNr::DetailReuseInfo Published() { return host.Published(State::Instance().fr
 void Release()
 {
     for (ID3D12Resource** res : { &detail[0], &detail[1], &colourDepth[0], &colourDepth[1], &prevMotion[0],
-                                  &prevMotion[1], &shownDetail, &composed, &estimate, &steadied, &coverage })
+                                  &prevMotion[1], &shownDetail, &composed, &estimate, &steadied, &coverage,
+                                  &carried })
     {
         if (*res != nullptr)
         {
@@ -760,6 +800,8 @@ void Release()
     cur = 0;
     savedMotion = 0;
     shownValid = false;
+    carriedWritten = false;
+    carriedFailed = false;
     host.Reset();
 }
 } // namespace DetailReuse

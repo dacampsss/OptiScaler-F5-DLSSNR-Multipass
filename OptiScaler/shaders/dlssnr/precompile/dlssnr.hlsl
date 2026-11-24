@@ -939,6 +939,169 @@ float StyleSkinWeight(float3 stored)
     return SkinColourWeight(gPassthrough != 0 ? stored : LinearToSrgb(saturate(DecodeProxyToLinear(stored))));
 }
 
+// Experimental input style ([DlssNr] InputStyle = 3), the smooth canvas: a cross bilateral filter over the
+// picture the model is shown, so skin reads like an untextured old-game surface (pores, fine shading and
+// shimmer flattened) while contours stay. A neighbour counts less the further away it is (Gaussian, sigma 3 px
+// at 1080 lines, 11x11 taps) and the more it differs from the reference, in two measures:
+//  - brightness, as exposure steps (log2 of the decoded luminance), so every proxy curve filters alike (PQ's
+//    stored values bunch steps together that the other curves keep apart): sigma 0.35 EV -- a +-20% skin texture
+//    (0.26 EV) keeps 75% weight, a 1 EV lip line about 2%, a hard edge nothing;
+//  - colour, as the distance of the chromaticities (each colour over its own r+g+b): sigma 0.03, so an edge of
+//    equal brightness but another colour (lips against skin, about 0.09; an iris, make-up) stays where a
+//    brightness-only filter smeared it. Faded out in the dark, where the chromaticity is mostly noise.
+// The reference is the pixel itself, unless it is a speck: fewer than two of its eight neighbours within one
+// sigma of it. A lone pore or sparkle compared with itself would only average with its own kind and survive;
+// compared with its neighbourhood's mean it flattens like the rest. A line (two like neighbours) stays, and so
+// does a speck more than 1.5 EV off its neighbourhood (a catchlight in an eye is no pore).
+// The reach follows the picture: above 1080 lines the taps spread out (sigma 3 px * lines / 1080, the same
+// 11x11 count), so a face looks alike at every Resolution % and output size.
+// Averaged in light and re-encoded once. gTransferStrength blends with the picture as it was (0..1); a strength
+// above 1 runs this pass again on its own result (DlssNrInput::Runs). Faces only scales the blend by the pixel's
+// skin-colour weight.
+//
+// Two entry points run it: CSMain's mode 16, which decodes every tap from gSource (the reference, and what Vulkan runs),
+// and the tiled build of this file (DLSSNR_SMOOTH_CANVAS_TILED, D3D12), where each 16x16 group decodes its tile and a
+// SC_RADIUS border once into group-shared memory and the taps read that: the same numbers for a fraction of the work
+// (every tap decoded the curve, a log and a colour ratio; 129 of them per pixel). CanvasFetch is the one difference.
+// The two builds are equal on WARP (tests/nr_input_style_shader_smoke.cpp); a driver may round them differently.
+// The reach is at most 2 (2160 lines and up), so the taps stay within SC_RADIUS = 10 pixels.
+#define SC_GROUP 16
+#define SC_RADIUS 10
+#define SC_TILE (SC_GROUP + 2 * SC_RADIUS)
+
+// A tap: its light (decoded) and its brightness in EV
+float4 CanvasTap(float3 stored)
+{
+    const float3 light = DecodeProxyToLinear(saturate(stored));
+    return float4(light, log2(max(max(dot(light, kLuma), 0.0), 1e-4)));
+}
+
+#if defined(DLSSNR_SMOOTH_CANVAS_TILED)
+groupshared float4 scTile[SC_TILE * SC_TILE];
+static int2 scOrigin; // the tile's first pixel (top left of the border), unclamped
+
+float4 CanvasFetch(int2 pos, int2 last)
+{
+    const int2 local = pos - scOrigin;
+    return scTile[local.y * SC_TILE + local.x];
+}
+#else
+float4 CanvasFetch(int2 pos, int2 last)
+{
+    return CanvasTap(gSource.Load(int3(clamp(pos, int2(0, 0), last), 0)).rgb);
+}
+#endif
+
+float4 SmoothCanvasPixel(uint2 pixel)
+{
+    uint w, h;
+    gSource.GetDimensions(w, h);
+    const int2 last = int2((int) w - 1, (int) h - 1);
+    const int2 centrePos = (int2) pixel;
+
+    const float4 centre = gSource.Load(int3(pixel, 0));
+    const float3 storedCentre = saturate(centre.rgb);
+    const float4 tapCentre = CanvasFetch(centrePos, last);
+    const float3 lightCentre = tapCentre.rgb;
+    const float lumaCentre = max(dot(lightCentre, kLuma), 0.0);
+    const float evCentre = tapCentre.a;
+    const float3 chromaCentre = lightCentre / max(lightCentre.r + lightCentre.g + lightCentre.b, 1e-6);
+
+    const float evScale = 1.0 / (0.35 * 0.35);
+    const float chromaScale = 1.0 / (0.03 * 0.03);
+    const float chromaDark = 0.005; // decoded luminance below which the colour term fades out
+
+    // Speck test and the neighbourhood's mean (edge neighbours 2, corners 1).
+    float similar = 0.0, meanWeights = 0.0, evMean = 0.0;
+    float3 chromaMean = 0;
+    [unroll] for (int ny = -1; ny <= 1; ++ny)
+    {
+        [unroll] for (int nx = -1; nx <= 1; ++nx)
+        {
+            if (nx == 0 && ny == 0)
+                continue;
+            const float4 tap = CanvasFetch(centrePos + int2(nx, ny), last);
+            const float3 light = tap.rgb;
+            const float luma = max(dot(light, kLuma), 0.0);
+            const float ev = tap.a;
+            const float3 chroma = light / max(light.r + light.g + light.b, 1e-6);
+            const float3 dc = chroma - chromaCentre;
+            const float de = ev - evCentre;
+            const float dark = saturate(min(luma, lumaCentre) / chromaDark);
+            similar += (de * de * evScale + dot(dc, dc) * chromaScale * dark) < 1.0 ? 1.0 : 0.0;
+            const float k = (nx == 0 || ny == 0) ? 2.0 : 1.0;
+            evMean += ev * k;
+            chromaMean += chroma * k;
+            meanWeights += k;
+        }
+    }
+    // Only a speck of texture depth: one more than 1.5 EV off its neighbourhood (an eye's catchlight, a star, a
+    // lamp) is a feature, and is filtered as itself.
+    const bool speck = similar < 2.0 && abs(evCentre - evMean / meanWeights) < 1.5;
+    const float evRef = speck ? evMean / meanWeights : evCentre;
+    const float3 chromaRef = speck ? chromaMean / meanWeights : chromaCentre;
+    const float lumaRef = exp2(evRef);
+
+    const float reach = clamp((float) h / 1080.0, 1.0, 2.0); // tap spacing in pixels (SC_RADIUS holds 5 * 2)
+    const float spatialScale = -1.0 / (2.0 * 3.0 * 3.0);
+    float3 sum = 0;
+    float weights = 0.0;
+
+    [loop] for (int dy = -5; dy <= 5; ++dy)
+    {
+        [loop] for (int dx = -5; dx <= 5; ++dx)
+        {
+            const int2 offset = (int2) round(float2(dx, dy) * reach);
+            const float4 tap = CanvasFetch(centrePos + offset, last);
+            const float3 light = tap.rgb;
+            const float luma = max(dot(light, kLuma), 0.0);
+            const float de = tap.a - evRef;
+            const float3 dc = light / max(light.r + light.g + light.b, 1e-6) - chromaRef;
+            const float dark = saturate(min(luma, lumaRef) / chromaDark);
+            const float range = de * de * evScale + dot(dc, dc) * chromaScale * dark;
+            const float weight = exp((float) (dx * dx + dy * dy) * spatialScale - 0.5 * range);
+            sum += light * weight;
+            weights += weight;
+        }
+    }
+
+    // Without a speck the centre's own weight is 1; a speck's reference is its neighbours' mean, which some
+    // neighbour is near. Should every weight still vanish, the pixel stays as it was.
+    const float3 smoothed = weights > 1e-6 ? EncodeLinearToProxy(sum / weights) : storedCentre;
+    float amount = saturate(gTransferStrength);
+
+    if (gSkinProtection != 0)
+        amount *= StyleSkinWeight(storedCentre);
+
+    return float4(lerp(centre.rgb, smoothed, amount), centre.a);
+}
+
+#if defined(DLSSNR_SMOOTH_CANVAS_TILED)
+// The smooth canvas alone (D3D12's input style pass), 16x16 per group. Every thread decodes its share of the tile and
+// border once; the pixel's filter then reads them from group-shared memory.
+[numthreads(SC_GROUP, SC_GROUP, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint w, h;
+    gSource.GetDimensions(w, h);
+    const int2 last = int2((int) w - 1, (int) h - 1);
+    scOrigin = (int2) (groupId.xy * SC_GROUP) - SC_RADIUS;
+
+    for (uint i = groupThreadId.y * SC_GROUP + groupThreadId.x; i < SC_TILE * SC_TILE; i += SC_GROUP * SC_GROUP)
+    {
+        const int2 pos = clamp(scOrigin + int2(i % SC_TILE, i / SC_TILE), int2(0, 0), last);
+        scTile[i] = CanvasTap(gSource.Load(int3(pos, 0)).rgb);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (id.x >= w || id.y >= h)
+        return;
+
+    gTarget[id.xy] = SmoothCanvasPixel(id.xy);
+}
+#else
+
 // Automatic exposure uses the same 8x8 group as every other mode, but spreads the expensive work
 // across all 64 lanes. Only 1 KiB of groupshared memory is reserved, so the ordinary encode/resolve
 // passes keep effectively the same occupancy.
@@ -1408,50 +1571,7 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 gr
     }
     if (gMode == 16)
     {
-        // Experimental input style ([DlssNr] InputStyle = 3), the smooth canvas: a cross bilateral filter over the
-        // picture the model is shown, so skin reads like an untextured old-game surface (pores, fine shading and
-        // shimmer flattened) while contours stay -- a neighbour counts less the further away it is (Gaussian, sigma
-        // 3 px, 11x11) and the more its brightness differs. Brightness is compared in light, as exposure steps
-        // (log2 of the decoded luminance), so every proxy curve filters alike (PQ's stored values bunch steps together
-        // that the other curves keep apart): sigma 0.35 EV -- a +-20% skin texture (0.26 EV) keeps 75% weight, a 1 EV
-        // lip line about 2%, a hard edge nothing. No quadrant switching as in the watercolour, so no blocks. Averaged in
-        // light and re-encoded once. gTransferStrength blends with the picture as it was (0..1); faces only scales it
-        // by the pixel's skin-colour weight.
-        uint w, h;
-        gSource.GetDimensions(w, h);
-        const int2 last = int2((int) w - 1, (int) h - 1);
-
-        const float4 centre = gSource.Load(int3(id.xy, 0));
-        const float3 storedCentre = saturate(centre.rgb);
-        const float evCentre = log2(max(dot(DecodeProxyToLinear(storedCentre), kLuma), 1e-4));
-
-        const float spatialScale = -1.0 / (2.0 * 3.0 * 3.0);
-        const float rangeScale = -1.0 / (2.0 * 0.35 * 0.35);
-        float3 sum = 0;
-        float weights = 0.0;
-
-        [loop] for (int dy = -5; dy <= 5; ++dy)
-        {
-            [loop] for (int dx = -5; dx <= 5; ++dx)
-            {
-                const float3 light = DecodeProxyToLinear(
-                    saturate(gSource.Load(int3(clamp((int2) id.xy + int2(dx, dy), int2(0, 0), last), 0)).rgb));
-                const float difference = log2(max(dot(light, kLuma), 1e-4)) - evCentre;
-                const float weight =
-                    exp((float) (dx * dx + dy * dy) * spatialScale + difference * difference * rangeScale);
-                sum += light * weight;
-                weights += weight;
-            }
-        }
-
-        // The centre's own weight is 1, so weights >= 1
-        const float3 smoothed = EncodeLinearToProxy(sum / weights);
-        float amount = saturate(gTransferStrength);
-
-        if (gSkinProtection != 0)
-            amount *= StyleSkinWeight(storedCentre);
-
-        gTarget[id.xy] = float4(lerp(centre.rgb, smoothed, amount), centre.a);
+        gTarget[id.xy] = SmoothCanvasPixel(id.xy);
         return;
     }
     if (gMode == 14)
@@ -2238,3 +2358,4 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 gr
     // Back into the game's own encoding (the Colour encoding override; nothing for Auto).
     gTarget[id.xy] = float4(EncodeGameColour(max(result, float3(0.0, 0.0, 0.0))), originalSample.a);
 }
+#endif // DLSSNR_SMOOTH_CANVAS_TILED

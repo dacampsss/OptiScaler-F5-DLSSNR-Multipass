@@ -1,4 +1,5 @@
 #include "pch.h"
+#include <algorithm>
 #include "XeFG_Dx12.h"
 #include <hudfix/Hudfix_Dx12.h>
 #include <menu/menu_overlay_dx.h>
@@ -10,6 +11,7 @@
 #include <nvapi/fakenvapi.h>
 #include <low_latency/input/input_common.h>
 #include <misc/FrameLimit.h>
+#include <misc/GpuMemory.h>
 #include <framegen/mfgunlock/MfgUnlock.h>
 #include <framegen/f5low/F5Low.h>
 #include <imgui/ImGuiNotify.hpp>
@@ -85,6 +87,9 @@ bool XeFG_Dx12::CreateSwapchainContext(ID3D12Device* device)
             LOG_ERROR("XeFG proxy can't find libxess_fg.dll!");
         return false;
     }
+
+    // a context parked by an earlier swapchain teardown may be free to go now
+    RetryParkedContexts("new context");
 
     // F5Low runs our f5low.dll: the XeFG unlock patches Intel's library only
     const bool f5low = State::Instance().activeFgOutput == FGOutput::F5Low;
@@ -191,6 +196,38 @@ void XeFG_Dx12::ApplyMaxInterpolations(uint32_t reported)
         LOG_INFO("Max supported interpolations: {}", _maxInterpolationCount);
 }
 
+// How much GPU memory the XeFG library asks for (its temporary buffer and texture heaps), for the GPU memory log. With
+// FG Output F5Low the library behind these calls is f5low.dll and the numbers are f5low's own estimate. Logging only.
+static void LogTempHeapSizes(xefg_swapchain_handle_t context, const xefg_swapchain_d3d12_init_params_t* params,
+                             uint32_t width, uint32_t height, DXGI_FORMAT format)
+{
+    if (!GpuMemory::Active() || context == nullptr || XeFGProxy::D3D12GetProperties() == nullptr)
+        return;
+
+    xefg_swapchain_properties_t props {};
+    const auto result = XeFGProxy::D3D12GetProperties()(context, params, width, height, format, &props);
+    if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS)
+    {
+        LOG_INFO("XeFG temp heap sizes not available: {} ({})", magic_enum::enum_name(result), (UINT) result);
+        return;
+    }
+
+    wchar_t path[MAX_PATH] {};
+    std::wstring name = L"?";
+    if (const DWORD n = GetModuleFileNameW(XeFGProxy::Module(), path, MAX_PATH); n > 0 && n < MAX_PATH)
+    {
+        name.assign(path, n);
+        name = name.substr(name.find_last_of(L"\\/") + 1);
+    }
+
+    LOG_INFO(
+        "XeFG library {} temp heaps at {}x{}, up to {} generated frame(s): buffers {} MB, textures {} MB, together "
+        "{} MB",
+        wstring_to_string(name), width, height, params != nullptr ? params->maxInterpolatedFrames : 0,
+        props.tempBufferHeapSize / (1024 * 1024), props.tempTextureHeapSize / (1024 * 1024),
+        (props.tempBufferHeapSize + props.tempTextureHeapSize) / (1024 * 1024));
+}
+
 void XeFG_Dx12::LogAcceptedInterpolations()
 {
     if (!MfgUnlock::IsXeFGActive() || XeFGProxy::D3D12GetInitializationParameters() == nullptr)
@@ -255,12 +292,84 @@ bool XeFG_Dx12::DestroySwapchainContext()
         {
             State::Instance().currentFGSwapchain = nullptr;
 
-            // Its XeLL context isn't read anymore
-            InputCommon::release_xefg_xell();
+            // Its XeLL context isn't read anymore, unless a parked context (refused before) still links it: then it
+            // goes once the last of those is destroyed (RetryParkedContexts)
+            bool parked = false;
+            {
+                std::lock_guard<std::mutex> lock(_parkedMutex);
+                parked = !_parkedContexts.empty();
+                _xellReleasePending = parked;
+            }
+
+            if (!parked)
+                InputCommon::release_xefg_xell();
         }
     }
 
     return true;
+}
+
+void XeFG_Dx12::ParkSwapchainContext(xefg_swapchain_handle_t context)
+{
+    std::lock_guard<std::mutex> lock(_parkedMutex);
+
+    if (std::find(_parkedContexts.begin(), _parkedContexts.end(), context) == _parkedContexts.end())
+        _parkedContexts.push_back(context);
+
+    LOG_WARN("Swapchain context {:X}: Destroy refused, kept to destroy later, {} waiting", (size_t) context,
+             _parkedContexts.size());
+}
+
+void XeFG_Dx12::RetryParkedContexts(const char* when)
+{
+    // (at process exit nothing is destroyed: DestroySwapchainContext skips it as well)
+    if (State::Instance().isShuttingDown)
+        return;
+
+    std::vector<xefg_swapchain_handle_t> parked;
+    {
+        std::lock_guard<std::mutex> lock(_parkedMutex);
+        parked.swap(_parkedContexts);
+    }
+
+    if (parked.empty())
+        return;
+
+    // Outside the lock: destroying a context releases its swapchain, which can come back into this class
+    std::vector<xefg_swapchain_handle_t> stillParked;
+    for (auto context : parked)
+    {
+        auto result = XeFGProxy::Destroy()(context);
+
+        if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS)
+            LOG_INFO("Parked swapchain context {:X} destroyed ({})", (size_t) context, when);
+        else
+            stillParked.push_back(context);
+    }
+
+    bool releaseXell = false;
+    {
+        std::lock_guard<std::mutex> lock(_parkedMutex);
+        _parkedContexts.insert(_parkedContexts.end(), stillParked.begin(), stillParked.end());
+
+        if (!_parkedContexts.empty())
+        {
+            LOG_DEBUG("{} parked swapchain context(s) still refused ({})", _parkedContexts.size(), when);
+        }
+        else if (_xellReleasePending && _swapChainContext == nullptr)
+        {
+            // the last parked context held the XeLL context the current one left behind (none current: a new one
+            // takes its own)
+            _xellReleasePending = false;
+            releaseXell = true;
+        }
+    }
+
+    if (releaseXell)
+    {
+        LOG_INFO("The last parked swapchain context is gone: its XeLL context is let go of");
+        InputCommon::release_xefg_xell();
+    }
 }
 
 xefg_swapchain_d3d12_resource_data_t XeFG_Dx12::GetResourceData(FG_ResourceType type, int index)
@@ -479,6 +588,8 @@ bool XeFG_Dx12::CreateSwapchain(IDXGIFactory* factory, ID3D12CommandQueue* cmdQu
 #endif // !DONT_USE_XMX
 
     xefg_swapchain_result_t result;
+    LogTempHeapSizes(_swapChainContext, &params, desc->BufferDesc.Width, desc->BufferDesc.Height,
+                     desc->BufferDesc.Format);
     result = XeFGProxy::D3D12InitFromSwapChainDesc()(_swapChainContext, hwnd, &scDesc, &fsDesc, realQueue, factory12,
                                                      &params);
 
@@ -643,9 +754,11 @@ bool XeFG_Dx12::CreateSwapchain1(IDXGIFactory* factory, ID3D12CommandQueue* cmdQ
     xefg_swapchain_result_t result;
 
     {
+        // The heap sizes are read inside the scope, like the init call they describe
 #ifndef DONT_USE_XMX
         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
 #endif // !DONT_USE_XMX
+        LogTempHeapSizes(_swapChainContext, &params, desc->Width, desc->Height, desc->Format);
         result = XeFGProxy::D3D12InitFromSwapChainDesc()(_swapChainContext, hwnd, desc, pFullscreenDesc, realQueue,
                                                          factory12, &params);
 
@@ -825,6 +938,8 @@ bool XeFG_Dx12::Shutdown()
 
     if (_swapChainContext != nullptr)
         DestroySwapchainContext();
+
+    RetryParkedContexts("shutdown");
 
     return true;
 }
@@ -2082,7 +2197,14 @@ bool XeFG_Dx12::ReleaseSwapchain(HWND hwnd)
         if (_swapChainContext != nullptr)
             DestroySwapchainContext();
 
+        // DestroySwapchainContext puts the context back when XeFG refuses (the swapchain still in use): keep it to
+        // destroy later instead of losing it with everything it holds
+        if (_swapChainContext != nullptr)
+            ParkSwapchainContext(_swapChainContext);
+
         _swapChainContext = nullptr;
+
+        RetryParkedContexts("swapchain released");
     }
 
     ReleaseObjects();

@@ -22,15 +22,16 @@ SamplerState LinearClamp : register(s0);
 Texture2D<float2> Motion : register(t1);
 Texture2D<uint2> Previous : register(t2);
 Texture2D<uint> Reconstructed : register(t3);
+#include "VkFormat.hlsli"
 #if DLSSNR_COMPACT_GHOST_STAGE == 2
-RWTexture2D<float> WritePhase : register(u0);
+VK_FORMAT("r32f") RWTexture2D<float> WritePhase : register(u0);
 #else
-RWTexture2D<uint> WriteDepth : register(u0);
+VK_FORMAT("r32ui") RWTexture2D<uint> WriteDepth : register(u0);
 #endif
-RWTexture2D<uint2> WriteState : register(u1);
+VK_FORMAT("rgba32ui") RWTexture2D<STATE_T> WriteState : register(u1);
 uint2 PreviousState(int2 p) { return Previous.Load(int3(p, 0)); }
-uint2 CurrentState(int2 p) { return WriteState[p]; }
-void StoreState(int2 p, uint2 bits) { WriteState[p] = bits; }
+uint2 CurrentState(int2 p) { return WriteState[p].xy; }
+void StoreState(int2 p, uint2 bits) { WriteState[p] = STATE_VALUE(bits); }
 #if DLSSNR_COMPACT_GHOST_STAGE == 2
 void StoreAge(int2 p, uint2 packed, float age)
 {

@@ -20,6 +20,7 @@ enum class Page : unsigned char
     Misc,
     Plugins, // after Misc, before the Neural Rendering group (enum order is not the nav order; see menu_common.cpp)
     Notifications, // every toast shown so far; right after Plugins
+    Status,        // what OptiScaler found and runs, for bug reports; last in the nav pane
     F5Lut,   // the LUT stack (after NR, or on the upscaler's output); shown right below the Neural Rendering group
     NrF5Low, // first under Neural Rendering: NR for a game that makes no upscaler call
     NrStatus,
@@ -47,6 +48,7 @@ inline constexpr PageInfo kPages[] = {
     { "misc", "Misc" },
     { "plugins", "Plugins" },
     { "notifications", "Notifications" },
+    { "status", "Status" },
     { "f5lut", "F5LUT" },
     { "nr.f5low", "Optical F5Low" },
     { "nr.status", "Status & Presets" },

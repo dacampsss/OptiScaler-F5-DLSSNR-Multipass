@@ -12,6 +12,9 @@
     <Filter Include="IFeature">
       <UniqueIdentifier>{0d5515bc-9b5a-4d33-a918-989059c29e08}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Plugins">
+      <UniqueIdentifier>{a3805674-e01c-4786-856f-119e7c376d29}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Config">
       <UniqueIdentifier>{eb352600-7864-4906-a7f8-b065f137cc80}</UniqueIdentifier>
     </Filter>
@@ -125,6 +128,12 @@
     <ClInclude Include="upscalers\dlssd\DLSSDFeature_Dx12.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="upscalers\nvngx\Nvngx_RR.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="upscalers\nvngx\Nvngx_RRDllProxy.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="upscalers\dlssd\DLSSDFeature_Vk.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -144,6 +153,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="proxies\FfxApi_Proxy.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="proxies\FfxModule.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="hooks\Vulkan_Hooks.h">
@@ -308,6 +320,12 @@
     <ClInclude Include="menu\menu_dx_base.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="plugins\PluginApi.h">
+      <Filter>Plugins</Filter>
+    </ClInclude>
+    <ClInclude Include="..\plugin_sdk\optiscaler_plugin.h">
+      <Filter>Plugins</Filter>
+    </ClInclude>
     <ClInclude Include="menu\menu_common.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -366,6 +384,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="inputs\XeSS_Dx12.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="inputs\XeSS_UE_Decode.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="inputs\XeSS_UE_Dx12.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="inputs\XeSS_Proxy.h">
@@ -491,6 +515,12 @@
     <ClInclude Include="native\VirtualUpscalerHold.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="misc\GpuMemTally.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="misc\GpuMemory.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="native\FpsLog.h">
     <ClInclude Include="native\GpuStageTiming.h">
       <Filter>Header Files</Filter>
@@ -505,6 +535,21 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="native\FrameContract.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="dlssnr\DlssNr_FinishedGameFrame.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="dlssnr\DlssNr_FinishedVk.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="dlssnr\DlssNr_FinishedVkGuides.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="dlssnr\DlssNr_FinishedVkRules.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="native\GuideRunner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="native\NativeProducer.h">
@@ -1089,6 +1134,12 @@
     <ClInclude Include="menu\NotificationsPage.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="menu\StatusPage.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="menu\StatusPageRules.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="misc\NotificationHistory.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -1395,6 +1446,12 @@
     <ClCompile Include="upscalers\dlssd\DLSSDFeature_Dx12.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="upscalers\nvngx\Nvngx_RR.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="upscalers\nvngx\Nvngx_RRDllProxy.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="upscalers\dlssd\DLSSDFeature_Vk.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -1408,6 +1465,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="inputs\XeSS_Dx12.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="inputs\XeSS_UE_Dx12.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="hooks\Vulkan_Hooks.cpp">
@@ -1479,6 +1539,9 @@
     <ClCompile Include="include\imgui\imgui_draw.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="plugins\PluginApi.cpp">
+      <Filter>Plugins</Filter>
+    </ClCompile>
     <ClCompile Include="menu\menu_common.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -1486,6 +1549,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="menu\NotificationsPage.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="menu\StatusPage.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="menu\menu_dx_base.cpp">
@@ -1507,6 +1573,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="shaders\depth_scale\DS_Dx12.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="misc\GpuMemory.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="misc\FrameLimit.cpp">
@@ -1582,6 +1651,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="native\DepthFinderCore.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="dlssnr\DlssNr_FinishedVk.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="native\GuideRunner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="native\NativeProducer.cpp">
@@ -1875,6 +1950,9 @@
     <ClCompile Include="framegen\f5low\F5Low.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="framegen\f5low\F5Low_Vk.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="framegen\mfgunlock\hde\hde64.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -2068,6 +2146,7 @@
     <ClInclude Include="dlssnr\DlssNr_InterPassSchedule.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="dlssnr\DlssNr_SuperiorGains.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="dlssnr\DlssNr_SuperiorScaling.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="dlssnr\DlssNr_SuperiorVkRule.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="shaders\dlssnr\superior\Constants.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="shaders\dlssnr\superior\Fields.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="shaders\dlssnr\superior\Pipeline.inl"><Filter>Header Files</Filter></ClInclude>

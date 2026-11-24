@@ -122,7 +122,7 @@ void StoreJointMotion(uint2 id, float2 nativePixel, float2 raw, bool packed)
 {
     const float2 v = raw * gMotionScale;
     const float2 motion = packed ? PwPack(nativePixel + v) - PwPack(nativePixel) : raw;
-    gTarget1[id] = all(isfinite(motion)) ? motion : 0.0;
+    gTarget1[id] = SuperiorMotionTexel(all(isfinite(motion)) ? motion : 0.0);
 }
 void JointGuides(uint3 id, bool packed)
 {

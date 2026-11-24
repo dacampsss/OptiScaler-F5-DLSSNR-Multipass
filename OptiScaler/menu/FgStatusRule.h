@@ -30,6 +30,7 @@ struct Input
     double shownFps = 0.0;               // frames on screen per second; 0 = not measured yet
     const char* blockedReason = nullptr; // why the output cannot run now (it turns itself off); null = nothing
     bool followsGame = false;            // Active follows the game's DLSS FG setting
+    const char* offReason = nullptr; // why generation is off when it is not Dynamic MFG (F5Low on Vulkan); null = DMFG
 };
 
 struct Status
@@ -56,6 +57,8 @@ inline Status Describe(const Input& in)
                                                        : ": off (Active is unticked)") };
     if (in.paused)
         return { Tone::Waiting, name + ": paused" };
+    if (in.generationOff && in.offReason != nullptr)
+        return { Tone::Waiting, name + ": " + in.offReason };
     if (in.generationOff)
         return { Tone::Waiting, name + ": 1X (Dynamic MFG holds back)" };
     if (!in.generating)

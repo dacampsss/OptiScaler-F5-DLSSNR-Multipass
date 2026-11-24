@@ -53,6 +53,7 @@ enum class FGNvngxReplacement : uint32_t
     Arturs,
     FFX,
     Combo,
+    Custom, // [FrameGen] FGNvngxReplacement=<name>: OptiScaler's custom\<name> folder (Config::FGNvngxCustomName)
 };
 
 enum class WorkingMode : uint32_t
@@ -183,6 +184,10 @@ class State
     FGOutput activeFgOutput = FGOutput::NoFG;
     // This should be set to a non-None value only if all other requirements are met and nvngx can be used
     FGNvngxReplacement activeFgNvngx = FGNvngxReplacement::None;
+    // The custom provider name in use when activeFgNvngx is Custom (Config::FGNvngxCustomName at startup)
+    std::string activeFgNvngxCustom;
+    // Config::FSRFGProvider FSR FG was started with, applied after a restart
+    std::string activeFsrFgProvider;
 
     // Streamline FG inputs
     Sl_Inputs slFGInputs = {};
@@ -286,6 +291,13 @@ class State
     ankerl::unordered_dense::map<unsigned int, bool> changeBackend;
     Upscaler newBackend = Upscaler::Reset;
 
+    // Handles of the game's ray reconstruction, they run on a DLSSD picked by Nvngx_RR
+    ankerl::unordered_dense::set<unsigned int> rrHandles;
+
+    // The game looked for ray reconstruction: loaded Streamline's DLSSD plugin, asked NGX for its requirements
+    // or read its parameters
+    bool rrRequested = false;
+
     // XeSS debug stuff
     bool xessDebug = false;
     int xessDebugFrames = 5;
@@ -298,6 +310,10 @@ class State
     std::atomic<float> xefgDynamicCapFps = 0.0f;
 
     bool dlssgGameDMFGSupported = false;
+    // The game's DLSS-G swapchain hooks were cleared at its plugin load because OptiScaler makes the frame generation
+    // swapchain (FG Input not DLSSG): its DLSS-G stays off for the session, even if OptiScaler's FG fails to start
+    // later
+    std::atomic<bool> gameDlssgReplacedByOwnFg = false;
     sl::DLSSGMode dlssgLastSetMode = sl::DLSSGMode::eOff;
     int dlssgDetectedInterpolationCount = 0;
     // The game's own DLSS FG choice (slDLSSGSetOptions) with FG Input DLSSG; OptiScaler's FG follows it while
@@ -327,6 +343,15 @@ class State
     bool dlssdPresetsOverriddenExternally = false;
     bool dlssdPresetsOverridenByOpti = false;
     uint32_t dlssdRenderPresetExternal = 0;
+    // DLSS-G frame generation preset (driver setting 0x10E41DF1): the driver profile's own value (0 = none/not read)
+    // and the value DLSS-G was answered with in this process (0 = not answered by us)
+    // Written on the game's thread at DLSS-G's read, shown by the menu
+    std::atomic<uint32_t> dlssgPresetExternal = 0;
+    std::atomic<uint32_t> dlssgPresetAnswered = 0;
+    std::atomic<bool> dlssgPresetRead = false; // any reader: nvngx_dlssg itself or Streamline's sl.common / sl.dlss_g
+    // Version of the nvngx_dlssg.dll that read the preset ({0,0,0,0} = not read by nvngx_dlssg itself); Preset C
+    // needs 310.9.16+
+    uint16_t dlssgPresetReaderVersion[4] {};
     uint32_t dlssdRenderPresetDLAA = 0;
     uint32_t dlssdRenderPresetUltraQuality = 0;
     uint32_t dlssdRenderPresetQuality = 0;
@@ -343,6 +368,13 @@ class State
     std::vector<std::string> detectedQuirks {};
 
     // FFX
+    // A version list of its own, for a custom FFX upscaler (custom\<name>\ffx, CustomFfxModule)
+    struct FfxVersionList
+    {
+        std::vector<uint64_t> ids;
+        std::vector<const char*> names;
+    };
+
     std::vector<const char*> ffxUpscalerVersionNames {};
     std::vector<uint64_t> ffxUpscalerVersionIds {};
     std::vector<const char*> ffxFGVersionNames {};

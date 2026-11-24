@@ -370,9 +370,14 @@ int main()
         CHECK(Same(SleepModeFor(game, Role::Output, in), Mode(false, false, 0)));
         in.blocked = false;
 
-        // XeFG with XeLL: low latency on whatever the game says, the cap in
+        // XeFG with XeLL: low latency on for an input that never turned it off, the cap in
         in.xefgOutput = true;
         CHECK(Same(SleepModeFor(gameOff, Role::Output, in), Mode(true, false, 13333)));
+
+        // ... the game turned its own Reflex off: XeLL follows it
+        in.gameTurnedOff = true;
+        CHECK(Same(SleepModeFor(gameOff, Role::Output, in), Mode(false, false, 13333)));
+        in.gameTurnedOff = false;
 
         // ... unless Force Disable
         in.forceDisabled = true;
@@ -443,6 +448,14 @@ int main()
         in.dlssgFramesToGenerate = 3;
         CHECK(CapForGame(in).fps == 15.0f);
         in.dlssgFramesToGenerate = 0;
+
+        // F5Low on a native Vulkan swapchain: the shown cap is divided per rendered frame (no driver multiplier there)
+        in.vkF5Low = true;
+        in.xefgShownPerRendered = 3;
+        CHECK(CapForGame(in).fps == 20.0f);
+        in.xefgShownPerRendered = 1;
+        CHECK(CapForGame(in).fps == 60.0f);
+        in.vkF5Low = false;
 
         // Force Disable stops its waits, Input Off and no output running: the limiter (one owner, never none)
         GameCapInputs off = in;
@@ -528,6 +541,24 @@ int main()
         in.xellCountsShown = true;
         in.xellHoldsCap = false;
         CHECK(!CapForGame(in).outputHoldsCap);
+
+        // The game turns its own Reflex off while XeFG generates and it keeps marking frames: XeLL's sleeps are
+        // skipped, so it does not hold the cap and the limiter keeps it (input_common.cpp update builds xellHoldsCap
+        // this way); one owner, never none
+        {
+            using namespace native::xefgreflex;
+            GameCapInputs off = in;
+            off.gameLowLatencyOn = false;
+            off.gameSendingMarkers = true;
+            const bool turnedOff = GameTurnedLowLatencyOff(true, true, off.gameLowLatencyOn, false);
+            off.xellHoldsCap = XellHoldsCap(XellSleepsOff(false, false, turnedOff, false), false, true, false);
+            CHECK(turnedOff && !off.xellHoldsCap && !CapForGame(off).outputHoldsCap);
+
+            // ... Force Enable: XeLL's sleeps run and it keeps the cap
+            const bool forced = GameTurnedLowLatencyOff(true, true, false, false, true);
+            off.xellHoldsCap = XellHoldsCap(XellSleepsOff(false, false, forced, false), false, true, false);
+            CHECK(!forced && CapForGame(off).outputHoldsCap);
+        }
 
         // ... a game that only marks frames counts too
         markersOnly.xefgOutput = true;

@@ -1,6 +1,7 @@
 #include "pch.h"
 #include <mutex>
 #include "../../OptiScaler/dlssnr/DlssNr_StreamlinePicture.h"
+#include "../../OptiScaler/dlssnr/DlssNr_FinishedGameFrame.h" // ApplyFinishedPictureInput's Vulkan-game parameter
 static void Expect(bool condition, const char* message) { if (!condition) throw std::runtime_error(message); }
 static bool running = false, registered = false;
 static unsigned sets = 0, runs = 0, skips = 0, flowResets = 0, virtualPauses = 0;

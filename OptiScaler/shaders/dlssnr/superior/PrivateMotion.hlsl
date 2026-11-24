@@ -1,5 +1,6 @@
 Texture2D<float2> Motion : register(t0);
-RWTexture2D<uint2> Result : register(u0);
+#include "VkFormat.hlsli"
+VK_FORMAT("rgba32ui") RWTexture2D<STATE_T> Result : register(u0);
 cbuffer Params : register(b0)
 {
     uint mode;
@@ -44,5 +45,5 @@ groupshared uint Counts[256];
         GroupMemoryBarrierWithGroupSync();
     }
     if (lane == 0)
-        Result[uint2(0, 0)] = uint2(Counts[0] & 65535u, Counts[0] >> 16u);
+        Result[uint2(0, 0)] = STATE_VALUE(uint2(Counts[0] & 65535u, Counts[0] >> 16u));
 }

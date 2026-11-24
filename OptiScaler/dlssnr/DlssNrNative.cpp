@@ -248,6 +248,7 @@ bool EndEvaluate(ID3D12GraphicsCommandList*cmd){auto&s=S();std::lock_guard<std::
 std::vector<std::string> TakeProfileReports(){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);return s.prof.TakeReports();}
 std::string VitStatus(){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);return s.vit.Status();}
 bool VitPlainKernels(){return S().vit.LastSet()==DlssNrVitReuse::KernelSet::Plain;}
+bool VitKernelsSeen() { return S().vit.LastSet() != DlssNrVitReuse::KernelSet::Unknown; }
 // Not in DlssNrNative.h: only DlssNrNative_Vk.cpp drives the filter directly (one launch per call there).
 DlssNrVitReuse::Filter& VitFilter(){return S().vit;}
 const char* VitKernelSet(){switch(S().vit.LastSet()){case DlssNrVitReuse::KernelSet::Fp8:return "FP8";case DlssNrVitReuse::KernelSet::Plain:return "plain FP16";default:return "not seen yet";}}

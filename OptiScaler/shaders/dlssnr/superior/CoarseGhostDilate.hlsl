@@ -11,10 +11,11 @@ cbuffer Params : register(b0)
     float fade;
 };
 Texture2D<uint2> State : register(t0);
-RWTexture2D<float> Field : register(u0);
+#include "VkFormat.hlsli"
+VK_FORMAT("r32f") RWTexture2D<float> Field : register(u0);
 #ifdef DLSSNR_GHOST_CONTRAST
 Texture2D<float4> Reference : register(t1);
-RWTexture2D<float4> ExpandedReference : register(u1);
+VK_FORMAT("rgba16f") RWTexture2D<float4> ExpandedReference : register(u1);
 #endif
 [numthreads(8, 8, 1)] void CoarseGhostDilate(uint3 id : SV_DispatchThreadID)
 {

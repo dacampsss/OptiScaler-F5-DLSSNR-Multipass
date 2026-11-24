@@ -347,8 +347,19 @@ void UpscalerInputsDx12::UpscaleStart(ID3D12GraphicsCommandList* InCmdList, NVSD
                     setResource.width = feature->RenderWidth();
                     setResource.height = feature->RenderHeight();
                 }
-                setResource.state = (D3D12_RESOURCE_STATES) Config::Instance()->DepthResourceBarrier.value_or(
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                // An input that made the depth itself says which state it is in (XeSS in Unreal Engine games)
+                unsigned int depthState = 0;
+
+                if (InParameters->Get(OptiKeys::DepthState, &depthState) == NVSDK_NGX_Result_Success && depthState != 0)
+                {
+                    setResource.state = (D3D12_RESOURCE_STATES) depthState;
+                }
+                else
+                {
+                    setResource.state = (D3D12_RESOURCE_STATES) Config::Instance()->DepthResourceBarrier.value_or(
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                }
+
                 setResource.validity = FG_ResourceValidity::ValidNow;
 
                 fg->SetResource(&setResource);

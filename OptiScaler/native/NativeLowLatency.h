@@ -121,6 +121,7 @@ struct Status
     // What lowers latency here whoever makes the calls (plain words, never empty): the menu's "Active: <input> -> <output>"
     const char* output = "";
     bool offKeptForFrameGeneration = false; // Input is Off, but DLSS FG needs Reflex: the game's Reflex stays on
+    bool gameReflexOff = false; // the game turned its own Reflex off (InputCommon::game_turned_low_latency_off)
 };
 
 // Frame generation that runs Reflex itself (DLSS FG, an external owner): it cannot work with low latency off. Any thread.
@@ -158,7 +159,8 @@ inline const char* ReasonText(const Status& status)
     if (status.decision == Decision::Run)
         return status.path[0] != '\0' ? status.path : "Starting";
 
-    return DecisionText(status.decision, status.gameReflexFeedsXell, status.forceReflexDisabled, status.xefgSide);
+    return DecisionText(status.decision, status.gameReflexFeedsXell, status.forceReflexDisabled, status.xefgSide,
+                        status.gameReflexOff);
 }
 
 // We run (markers and Sleep go out). Any thread, two relaxed loads.

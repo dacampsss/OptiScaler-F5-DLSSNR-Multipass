@@ -53,6 +53,28 @@ template <class Device, class Physical, class Queue> class VkDeviceRegistry
         return true;
     }
 
+    // The distinct queue families the device's queues were made in, in order of first sight.
+    std::vector<uint32_t> FamiliesOf(Device device) const
+    {
+        std::vector<uint32_t> families;
+
+        for (const auto& [queue, entry] : _queues)
+        {
+            if (entry.device != device)
+                continue;
+
+            bool known = false;
+
+            for (const uint32_t seen : families)
+                known = known || seen == entry.family;
+
+            if (!known)
+                families.push_back(entry.family);
+        }
+
+        return families;
+    }
+
     Physical PhysicalOf(Device device) const
     {
         const auto it = _physical.find(device);

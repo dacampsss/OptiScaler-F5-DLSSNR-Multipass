@@ -98,6 +98,9 @@ int main()
         in.generationOff = true;
         CHECK(Describe(in).tone == Tone::Waiting);
         CHECK(Describe(in).text.find("1X") != std::string::npos);
+        in.offReason = "the swapchain has no spare images";
+        CHECK(Describe(in).text.find("1X") == std::string::npos);
+        CHECK(Describe(in).text.find("spare images") != std::string::npos);
     }
     {
         auto in = Running(2, 180.0);

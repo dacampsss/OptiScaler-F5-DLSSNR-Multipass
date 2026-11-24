@@ -27,15 +27,30 @@ struct SleepMode
     bool useMarkersToOptimize = false;
 };
 
+// The game turned its own Reflex off: its Reflex calls are the input, it has called SetSleepMode, and that mode has low
+// latency off. A game that only marks frames or sleeps without ever setting a mode, OptiScaler's own calls and the UE
+// mod's never count: nothing was turned off there. Not while a frame generation needs Reflex on
+// (native::lowlatency::FrameGenerationNeedsReflex), nor with fakenvapi's Force Enable (XeLL's sleeps run then).
+// InputCommon::game_turned_low_latency_off is the one place that asks: XeLL's sleep mode, the frame cap and the menu
+// must agree, or the cap can end up with no owner.
+constexpr bool GameTurnedLowLatencyOff(bool gameReflexIsInput, bool gameSetMode, bool gameLowLatencyOn,
+                                       bool frameGenerationNeedsReflex, bool forceEnabled = false)
+{
+    return gameReflexIsInput && gameSetMode && !gameLowLatencyOn && !frameGenerationNeedsReflex && !forceEnabled;
+}
+
 // The sleep mode the game's Reflex output gets. OptiScaler's frame cap replaces the game's interval when one is set.
-// While XeFG is the output (its XeLL, D3D or the bridge), low latency is on whatever the game's own Reflex setting
-// says: XeFG always uses XeLL, fakenvapi's XeLL skips every sleep and marker while the mode it was given is off, and
-// its frame cap waits in those sleeps (Reflex off in RDR2's menu left both doing nothing). Only the user turns it off,
-// with fakenvapi's Force Disable. Not written for XeLL alone: whichever low latency XeFG is paired with gets the same.
+// While XeFG is the output (its XeLL, D3D or the bridge), low latency is on: XeFG always uses XeLL, and an input that
+// never said anything about low latency (a game that only marks frames) would leave it doing nothing. It goes off when
+// the game turned its own Reflex off (`gameTurnedOff`, GameTurnedLowLatencyOff: the game's setting is followed, as
+// upstream does) or with fakenvapi's Force Disable. XeLL then skips every sleep and marker, so its frame cap cannot
+// wait there either: OptiScaler's limiter keeps the cap (the caller hands XellHoldsCap the same answer; Reflex off in
+// RDR2's menu once left the cap doing nothing). Not written for XeLL alone: whichever low latency XeFG is paired with
+// gets the same.
 // `blockLowLatency` (the Framerate page's Input: Off, any output): low latency off, no Boost, no interval whatever the
 // game or the cap says; OptiScaler's limiter keeps the cap (XellHoldsCap and ReflexHooks::update do not hand it over).
 inline SleepMode SleepModeForOutput(const SleepMode& game, uint32_t capIntervalUs, bool xefgOutput, bool forceDisabled,
-                                    bool blockLowLatency = false)
+                                    bool blockLowLatency = false, bool gameTurnedOff = false)
 {
     SleepMode out = game;
 
@@ -51,7 +66,7 @@ inline SleepMode SleepModeForOutput(const SleepMode& game, uint32_t capIntervalU
         out.minimumIntervalUs = capIntervalUs;
 
     if (xefgOutput)
-        out.lowLatency = !forceDisabled;
+        out.lowLatency = !forceDisabled && !gameTurnedOff;
 
     return out;
 }
@@ -99,15 +114,24 @@ inline SleepMode DriverSleepModeInSplit(const SleepMode& game, uint32_t capInter
 }
 
 // Whether XeFG's XeLL keeps the frame cap the game's Reflex hands it: while it is not idle (NativeLowLatencyRule.h
-// XellIdle: on NVIDIA and AMD it does nothing while XeFG generates no frames), not turned off with fakenvapi's
-// Force Disable and frame generation presents without V-Sync (XellKeepsCap). OptiScaler's limiter keeps it otherwise.
+// XellIdle: on NVIDIA and AMD it does nothing while XeFG generates no frames), not turned off (`forceDisabled`:
+// fakenvapi's Force Disable, Input Off, the split, or the game turned its own Reflex off, GameTurnedLowLatencyOff) and
+// frame generation presents without V-Sync (XellKeepsCap). OptiScaler's limiter keeps it otherwise.
 inline bool XellHoldsCap(bool forceDisabled, bool intelGpu, bool xefgGenerating, bool xefgVsync)
 {
+    // (forceDisabled: any reason XeLL's sleeps do not run, XellSleepsOff)
     lowlatency::CapInputs in;
     in.method = lowlatency::Method::XellWithXefg;
     in.intelGpu = intelGpu;
     in.xefgGenerating = xefgGenerating;
     return !forceDisabled && !lowlatency::XellIdle(in) && lowlatency::XellKeepsCap(xefgVsync);
+}
+
+// Why XeFG's XeLL does not sleep, so cannot keep the cap (XellHoldsCap's first argument): Force Disable, Input Off,
+// another output in the split, or the game turned its own Reflex off (the same answer SleepModeForOutput gets)
+constexpr bool XellSleepsOff(bool forceDisabled, bool blocked, bool gameTurnedOff, bool split)
+{
+    return forceDisabled || blocked || gameTurnedOff || split;
 }
 
 } // namespace native::xefgreflex

@@ -2,6 +2,7 @@
 
 #include "VulkanwDx12_Hooks.h"
 #include <dlssnr/DlssNr_ExposureScan_Vk.h>
+#include <dlssnr/DlssNr_FinishedVk.h>
 #include <resource_tracking/GenericDepth_Vk.h>
 
 #include <State.h>
@@ -6174,6 +6175,7 @@ void Vulkan_wDx12::hk_vkCmdExecuteCommands(VkCommandBuffer commandBuffer, uint32
     }
 
     GenericDepthVk::ExecuteCommands(commandBuffer, commandBufferCount, pCommandBuffers);
+    DlssNr::FinishedVk::NoteExecuteCommands(commandBuffer, commandBufferCount, pCommandBuffers);
     o_vkCmdExecuteCommands(cmdBuffer, commandBufferCount, pCommandBuffers);
 }
 
@@ -6327,7 +6329,53 @@ static const VkTimelineSemaphoreSubmitInfo* FindTimelineSubmitInfo(const void* p
     return nullptr;
 }
 
+// The three submit hooks tell Finished Picture's capture ring what the game sent, but only once the real call succeeded
+// (a failed submit runs nothing, so its captures must not be used), through the inner functions that hold the interop.
 VkResult Vulkan_wDx12::hk_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits,
+                                        VkFence fence)
+{
+    const VkResult result = QueueSubmitInner(queue, submitCount, pSubmits, fence);
+
+    if (result == VK_SUCCESS && pSubmits != nullptr)
+    {
+        for (uint32_t i = 0; i < submitCount; i++)
+            DlssNr::FinishedVk::AfterSubmit(queue, pSubmits[i].pCommandBuffers, pSubmits[i].commandBufferCount);
+    }
+
+    return result;
+}
+
+VkResult Vulkan_wDx12::hk_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits,
+                                         VkFence fence)
+{
+    const VkResult result = QueueSubmit2Inner(queue, submitCount, pSubmits, fence);
+
+    if (result == VK_SUCCESS && pSubmits != nullptr)
+    {
+        for (uint32_t i = 0; i < submitCount; i++)
+            DlssNr::FinishedVk::AfterSubmit2(queue, pSubmits[i].pCommandBufferInfos,
+                                             pSubmits[i].commandBufferInfoCount);
+    }
+
+    return result;
+}
+
+VkResult Vulkan_wDx12::hk_vkQueueSubmit2KHR(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits,
+                                            VkFence fence)
+{
+    const VkResult result = QueueSubmit2KHRInner(queue, submitCount, pSubmits, fence);
+
+    if (result == VK_SUCCESS && pSubmits != nullptr)
+    {
+        for (uint32_t i = 0; i < submitCount; i++)
+            DlssNr::FinishedVk::AfterSubmit2(queue, pSubmits[i].pCommandBufferInfos,
+                                             pSubmits[i].commandBufferInfoCount);
+    }
+
+    return result;
+}
+
+VkResult Vulkan_wDx12::QueueSubmitInner(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits,
                                         VkFence fence)
 {
     if (o_vkQueueSubmit == nullptr)
@@ -6622,7 +6670,7 @@ static VkResult Submit2WithDx12Interop(SubmitFn originalSubmit, VkQueue queue, u
     return originalSubmit(queue, static_cast<uint32_t>(finalSubmits.size()), finalSubmits.data(), fence);
 }
 
-VkResult Vulkan_wDx12::hk_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits,
+VkResult Vulkan_wDx12::QueueSubmit2Inner(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits,
                                          VkFence fence)
 {
     if (o_vkQueueSubmit2 == nullptr)
@@ -6667,7 +6715,7 @@ VkResult Vulkan_wDx12::hk_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, co
     return result;
 }
 
-VkResult Vulkan_wDx12::hk_vkQueueSubmit2KHR(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits,
+VkResult Vulkan_wDx12::QueueSubmit2KHRInner(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits,
                                             VkFence fence)
 {
     if (o_vkQueueSubmit2KHR == nullptr)
@@ -6723,6 +6771,7 @@ VkResult Vulkan_wDx12::hk_vkBeginCommandBuffer(VkCommandBuffer commandBuffer,
 #endif
 
     GenericDepthVk::BeginCommandBuffer(commandBuffer, pBeginInfo);
+    DlssNr::FinishedVk::ForgetCommandBuffers(1, &commandBuffer); // recorded again: what was in it is gone
     return o_vkBeginCommandBuffer(commandBuffer, pBeginInfo);
 }
 
@@ -6758,6 +6807,7 @@ VkResult Vulkan_wDx12::hk_vkResetCommandBuffer(VkCommandBuffer commandBuffer, Vk
         cmdBufferStateTracker.OnReset(commandBuffer);
 
     GenericDepthVk::ForgetCommandBuffers(1, &commandBuffer);
+    DlssNr::FinishedVk::ForgetCommandBuffers(1, &commandBuffer);
     return o_vkResetCommandBuffer(commandBuffer, flags);
 }
 
@@ -6774,6 +6824,7 @@ void Vulkan_wDx12::hk_vkFreeCommandBuffers(VkDevice device, VkCommandPool comman
 
     // Call original function
     GenericDepthVk::ForgetCommandBuffers(commandBufferCount, pCommandBuffers);
+    DlssNr::FinishedVk::ForgetCommandBuffers(commandBufferCount, pCommandBuffers);
     o_vkFreeCommandBuffers(device, commandPool, commandBufferCount, pCommandBuffers);
 }
 

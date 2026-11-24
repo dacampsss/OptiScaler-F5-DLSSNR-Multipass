@@ -250,6 +250,10 @@ class Config
     CustomOptional<bool> LogToConsole { false };
     CustomOptional<bool> LogToDebug { false };
     CustomOptional<bool> LogToNGX { false };
+    // [Memory] high residency priority scope: 0 off, 1 fg (default), 2 all (read once)
+    CustomOptional<int> ProtectMemory { 1 };
+    CustomOptional<bool, NoDefault>
+        LogGpuMemory; // [Log] "GPU memory by module" lines; unset (auto) = on with LogToFile (read once)
     CustomOptional<bool> D3D12Dred { false }; // [Log] D3D12 device-removed breadcrumbs on the D3D11 bridge's device
     CustomOptional<bool> CrashDump { false }; // [Log] write OptiScaler_crash.dmp when the game crashes (read once at start)
     CustomOptional<bool> OpenConsole { false };
@@ -264,6 +268,10 @@ class Config
     CustomOptional<bool> BuildPipelines { true };
     CustomOptional<int32_t> NetworkModel { 0 };
     CustomOptional<bool> CreateHeaps { true };
+    // Unreal Engine games with Intel's XeSS plugin: take the scene depth and render resolution motion vectors from the
+    // plugin's velocity flattening, which gives XeSS neither (inputs/XeSS_UE_Dx12.cpp). Checked at each XeSS context
+    // until the plugin is hooked, no effect after that.
+    CustomOptional<bool> XeSSUnrealDepth { true };
 
     // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) --- removable as one block -----------------
     // DLSS Neural Rendering: a detail-synthesis pass over the upscaler's output. Off by default -- it is
@@ -352,6 +360,11 @@ class Config
     // The model's render preset hint: 1 Preset A (the main model), 2 Preset B (the small model, 310.9 DLLs only); 0 and
     // any other value: the DLL's choice, the small model on 310.9 DLLs. 310.8 DLLs have only the main model.
     CustomOptional<uint32_t> DlssNrPreset { 0 };
+    // Model weights, one folder per model under OptiScaler/nr_weights (files named <resource>.<CRC32 of the stock
+    // resource>.bin, exported for that DLL); empty = the DLL's own weights. A = Preset A (main model), B = Preset B
+    // or Default (small model). The old single [DlssNr] WeightsSet is migrated when the file has neither new key.
+    CustomOptional<std::string> DlssNrWeightsSetA { std::string() };
+    CustomOptional<std::string> DlssNrWeightsSetB { std::string() };
     CustomOptional<float> DlssNrIntensity { 1.0f };
     // 0 default (standard), 1 natural, 2 cinematic -- the model's own processing profiles.
     CustomOptional<uint32_t> DlssNrStyle { 0 };
@@ -487,6 +500,9 @@ class Config
     CustomOptional<uint32_t> DlssNrTransfer { 1 }; // 11: Superior Scaling
     // Private SR preference: No DLSS=0, CNN=1 (D/E), Transformer=11 (K).
     CustomOptional<uint32_t> DlssNrSuperiorScalingPreset { 1 };
+    // Superior Scaling's private DLSS also steadies NR at 100% Model resolution and above (above: on the answer after
+    // it is averaged back to native). Off = the private DLSS runs only below 100%, as before 0.1.39.
+    CustomOptional<bool> DlssNrSuperiorAtNative { true };
 
     // Measure the white point from the frame instead of taking it from the slider. On a frame the
     // game already tone mapped there is nothing to measure and this has no effect.
@@ -577,9 +593,10 @@ class Config
     // DlssNrInputStructureHint: local contrast raised on luminance, CAS-like, overshoot bounded; strength 0..3.
     // DlssNrInputStyleFacesOnly: both only where the colour looks like skin (the same colour test as
     // SkinProtection). The resolve compares the answer against the same restyled picture, so Composed hands back only
-    // what the model painted; Replace shows the model's painting as it is. Skipped at model resolution above 100% and on
-    // the deferred path. The ini also keeps the old single InputStyle / InputStyleStrength (read when none of the new
-    // keys is set, and written as the first style that runs, for a build from before).
+    // what the model painted; Replace shows the model's painting as it is. Skipped on the deferred path, and on Vulkan
+    // above 100% model resolution without Compress screen edges. The ini also keeps the old single InputStyle /
+    // InputStyleStrength (read when none of the new keys is set, and written as the first style that runs, for a build
+    // from before).
     CustomOptional<uint32_t> DlssNrInputFlatten { DlssNrInput::kFlattenOff };
     CustomOptional<float> DlssNrInputFlattenStrength { 1.0f };
     CustomOptional<bool> DlssNrInputStructureHint { false };
@@ -976,6 +993,8 @@ class Config
     CustomOptional<std::wstring, NoDefault> FfxDx12RRPath;
     CustomOptional<std::wstring, NoDefault> FfxDx12RCPath;
     CustomOptional<std::wstring, NoDefault> FfxVkPath;
+    CustomOptional<std::wstring, NoDefault> FfxVkSRPath;
+    CustomOptional<std::wstring, NoDefault> FfxVkFGPath;
     CustomOptional<std::wstring, NoDefault> XeSSLibrary;
     CustomOptional<std::wstring, NoDefault> XeFGLibrary;
     CustomOptional<std::wstring, NoDefault> XeLLLibrary;
@@ -1144,6 +1163,29 @@ class Config
     // FSR
     CustomOptional<bool> FsrDebugView { false };
     CustomOptional<int> FfxUpscalerIndex { 0 };
+    // Custom upscaler name (misc/CustomProviders.h) of each API, stored in the API's upscaler setting in place of
+    // the upscaler it runs as, empty for the regular upscalers
+    CustomOptional<std::string, NoDefault> CustomUpscalerDx11;
+    CustomOptional<std::string, NoDefault> CustomUpscaler;
+    CustomOptional<std::string, NoDefault> CustomUpscalerVk;
+    // Folder in custom with a dlssd for the game's ray reconstruction, RRUpscaler in the ini, empty for auto
+    CustomOptional<std::string, NoDefault> CustomRRUpscaler;
+    // Regular upscaler running the game's ray reconstruction without denoising, RRUpscaler in the ini, empty for DLSSD
+    CustomOptional<Upscaler, NoDefault> RRRegularUpscaler;
+    // Regular upscalers can be picked for ray reconstruction, which is then offered to the game without a DLSSD
+    CustomOptional<bool> RRAllowRegularUpscalers { false };
+
+    // UpscalerIndex of [FSR] for the regular FFX upscaler, of [<name>] for a custom one
+    CustomOptional<int>& FfxUpscalerIndexFor(const std::string& custom)
+    {
+        // A custom folder named FSR shares [FSR] UpscalerIndex, the ini section it is saved in
+        if (custom.empty() || _stricmp(custom.c_str(), "FSR") == 0)
+            return FfxUpscalerIndex;
+
+        // Entries never move, the reference stays valid outside the lock
+        std::scoped_lock lock(_customIndexMutex);
+        return _ffxCustomUpscalerIndex.try_emplace(custom, 0).first->second;
+    }
     CustomOptional<int> FfxFGIndex { 0 };
     CustomOptional<bool> FsrUseMaskForTransparency { true };
     CustomOptional<bool> FsrNonLinearColorSpace { false };
@@ -1230,10 +1272,18 @@ class Config
     // [F5Low] KeepGameDlssg: with the DLSS-G generator the game's own nvngx_dlssg.dll is kept from loading (two DLSS-G
     // copies fault the GPU); true lets it load
     CustomOptional<bool> F5LowKeepGameDlssg { false };
+    CustomOptional<bool> F5LowVulkanFlipMetering { false }; // experimental, RTX 50: VK_NV_present_metering
+    CustomOptional<bool> F5LowVulkanPacer { true };         // use f5low's pacer when the f5low.dll exports it
+    CustomOptional<bool> F5LowVulkanLatencyGate { true };   // F5Low on Vulkan: bound how far the game runs ahead
+    CustomOptional<bool> F5LowVulkanTearing {
+        true
+    }; // F5Low on Vulkan: MAILBOX -> IMMEDIATE (V-Sync off shows every frame)
     // Keeps Streamline from picking up the driver's OTA/downloaded plugins; only files in
     // OptiScaler/streamline are used for sl.* plugins and nvngx_dlssg.dll
     CustomOptional<bool> FGStreamlineIgnoreOTA { false };
     CustomOptional<FGNvngxReplacement> FGNvngxReplacement { FGNvngxReplacement::None };
+    // With FGNvngxReplacement Custom: the folder name under OptiScaler's custom folder (any other value of the key)
+    std::string FGNvngxCustomName;
     CustomOptional<bool> FGDrawUIOverFG { false };
     CustomOptional<bool> FGUIPremultipliedAlpha { true };
     CustomOptional<bool> FGDisableHudless { false };
@@ -1314,6 +1364,8 @@ class Config
     CustomOptional<bool> FSRFGSkipConfigForHudless { false };
     CustomOptional<bool> FSRFGSkipDispatchForHudless { false };
     CustomOptional<bool> FSRFGEnableWatermark { false };
+    // Custom FFX FG name (misc/CustomProviders.h) used by FSR FG, empty for the regular one
+    CustomOptional<std::string, NoDefault> FSRFGProvider;
 
     // XeFG
     CustomOptional<bool> FGXeFGIgnoreInitChecks { false };
@@ -1344,6 +1396,9 @@ class Config
     CustomOptional<bool> FGDLSSGOverrideForceDMFG { false };   // Overrides game's DLSSG mode to Dynamic
     CustomOptional<bool> FGDLSSGForceDMFG { false };           // Overrides Opti's DLSSG mode to Dynamic
     CustomOptional<float> FGDLSSGFramerateTargetDMFG { 0.0f }; // 0.0 means auto-detects the display refresh rate
+    // DLSS-G frame generation preset, answered in this process to DLSS-G's driver-profile read (setting 0x10E41DF1):
+    // 0 = leave the driver/game choice, 1 = A (default model), 2 = B (UI focus), 3 = C (FG Lite, nvngx_dlssg 310.9.16+)
+    CustomOptional<int> FGDLSSGPreset { 0 };
 
     // As per
     // https://github.com/artur-graniszewski/dlss-enabler-main/blob/a92464d468eb0d91ae17befa66c6bf6229f20b9f/Utils/DlssgProxy.cpp#L1033
@@ -1417,6 +1472,12 @@ class Config
     static std::optional<DlssNrProfiles::File> ReadDlssNrProfile(const std::filesystem::path& path);
     bool SaveXeFG();
 
+    // Keys that aren't OptiScaler options (plugin settings), kept in the ini as they are
+    std::optional<std::string> GetRawValue(const char* section, const char* key);
+    void SetRawValue(const char* section, const char* key, const char* value);
+    void DeleteRawValue(const char* section, const char* key);
+    bool SaveRawValues();
+
     void CheckUpscalerFiles();
 
     // FG on/off and frame count. With FG Input DLSSG (Streamline 2+) and Enabled unset they follow the game's DLSS
@@ -1437,8 +1498,18 @@ class Config
     std::filesystem::path absoluteFileName;
     std::wstring fileName = L"OptiScaler.ini";
 
+    // Ini sections aren't case sensitive, the folder names neither
+    struct NoCaseLess
+    {
+        bool operator()(const std::string& a, const std::string& b) const { return _stricmp(a.c_str(), b.c_str()) < 0; }
+    };
+
+    std::map<std::string, CustomOptional<int>, NoCaseLess> _ffxCustomUpscalerIndex;
+    std::mutex _customIndexMutex;
+
     bool Reload(std::filesystem::path iniPath);
     void ReadDlssNr();
+    void ReadDlssNrWeightsSets();
     size_t ApplyDlssNrSection(const DlssNrProfiles::Section& section);
     DlssNrProfiles::Section savedDlssNr; // the kept [DlssNr] settings at the last load or Save Settings
 

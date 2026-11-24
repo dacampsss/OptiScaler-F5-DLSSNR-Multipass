@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "DlssNr_FinishedGameFrame.h"
 #include <shaders/dlssnr/DlssNr_Common.h>
 #include <shaders/dlssnr/DlssNr_Spatial.h>
 #include <shaders/dlssnr/DlssNr_Views.h>
@@ -93,6 +94,18 @@ bool RenderHeaderBanner(::Config* config, HeaderBanner::Feature feature, bool up
                         const std::string& upscalerNames, const std::string& backendName, const ImVec4& offerColour,
                         void (*upscalerFileChecks)());
 
+// The Status page's Neural Rendering and Optical F5Low lines (menu/StatusPage.cpp), read as the header line reads them
+struct StatusSummary
+{
+    bool nrEnabled = false;                                      // Enable Neural Rendering is on
+    std::string failure;                                         // why NR failed this session, empty when it has not
+    DlssNrNativeMode::Shown mode = DlssNrNativeMode::Shown::Off; // Optical F5Low's mode
+    bool gameCallsUpscaler = false;                              // so Optical F5Low stands aside
+    std::string backend;                                         // BackendName(): empty until the model is loaded
+    std::string vulkanRoute; // the Vulkan route's row; empty where the route is not offered (not a Vulkan game, dxvk)
+};
+StatusSummary CurrentStatusSummary(::Config* config);
+
 // A line on the Upscaler page while the current upscaler is Optical F5Low's own (the game makes no upscaler call), and
 // a hint on the Frame Generation page where Optical F5Low could give frame generation its input (`noUpscalerFeature`:
 // no upscaler is running).
@@ -103,6 +116,18 @@ void RenderF5LowFrameGenHint(::Config* config, bool noUpscalerFeature);
 // swapchain or the bridge with the game's upscaler ([DlssNr] NativeFrameGenerationOnly). Optical F5Low's NR + frame
 // generation is the third route and is chosen on its own page.
 void RenderVulkanRoute(::Config* config);
+
+// The Neural Rendering pages' "Runs on" line for a Vulkan game (native swapchain or D3D12 through the bridge), with the
+// fix for a D3D12 upscaler left behind. Nothing for other games.
+void RenderVulkanRunsOn(::Config* config);
+
+// The route is the native swapchain of a Vulkan game (the Frame Generation page labels the outputs that need the
+// bridge).
+bool VulkanNativeRoute(::Config* config);
+
+// Under the Frame Generation page's output combo: where `fgOutput` (framegen/FGOutput.h) needs the bridge and the route
+// is the native swapchain, a line saying so and the one click to the bridge. Never changes the route by itself.
+void RenderBridgeNeeded(::Config* config, uint32_t fgOutput);
 
 // Once per frame: after about ten seconds with no upscaler call (and the header making its Optical F5Low offer), one
 // toast per session points to the Optical F5Low page. [Menu] F5LowHint=false silences it.
@@ -124,6 +149,9 @@ void ApplyToFinishedPicture(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue
 uint64_t BeginStreamlinePicture();
 void EndStreamlinePicture(uint64_t snapshot, const char* unavailable = nullptr);
 void FinishedPictureUnavailable(const char* message);
+// Only the status line (FinishedPictureStatus), no cancel: a reason Finished Picture on a Vulkan game cannot run this
+// frame.
+void FinishedPictureNote(const char* message);
 // Streamline app-facing buffer, still PRESENT, on its original render queue before interpolation.
 void ApplyToStreamlinePicture(IDXGISwapChain* swapchain, ID3D12Resource* picture, ID3D12CommandQueue* queue,
                               uint64_t snapshot);
@@ -149,6 +177,21 @@ bool ApplyVirtualUpscalerInput(ID3D12CommandQueue* queue, ID3D12GraphicsCommandL
                                ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* historyDistrust,
                                bool depthReversed, bool reset, DXGI_COLOR_SPACE_TYPE colorSpace,
                                D3D12_RESOURCE_STATES pictureState, unsigned long long epoch);
+// Finished Picture on a native Vulkan game (dlssnr/DlssNr_FinishedVk.h, native/VkFrameSource.h): the same pass as
+// ApplyNativeInput, on the picture of the game's swapchain shared across APIs, with the depth and motion the game gave
+// its own upscaler (`depth` may be null; both rest in COMMON, at the game's allocation, and are left in it) and what
+// its call said about the frame (`game`). The picture is in `pictureState` on entry and is left in it. `epoch` is the
+// Vulkan present count.
+bool ApplyFinishedGameGuides(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* cmd, ID3D12Resource* color,
+                             ID3D12Resource* depth, ID3D12Resource* motion, const FinishedGameFrame& game,
+                             DXGI_COLOR_SPACE_TYPE colorSpace, D3D12_RESOURCE_STATES pictureState,
+                             unsigned long long epoch);
+// Finished Picture on a Vulkan game has been idle for a while (or NR is off): lets go of the pass the way a
+// switched-off NR does (the models and surfaces are parked, freed once the GPU is done with `cmd` and a few epochs went
+// by), and of the HDR10 scratch pair and the composition pass once nothing is parked any more. Call it every present
+// while it returns true, on a list that is then executed, with the caller's present count as `epoch`; the caller has
+// waited for its own last list.
+bool ReleaseFinishedIdle(ID3D12GraphicsCommandList* cmd, unsigned long long epoch);
 // A native-input frame went by without NR (NR off, a mode without NR, the virtual upscaler's own pass): the next NR frame
 // starts its history over instead of blending with the picture from before the gap. The two entries above do this
 // themselves for a frame they did not run on.

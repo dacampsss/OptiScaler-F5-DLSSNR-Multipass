@@ -456,6 +456,18 @@ std::optional<LowLatencyMode> InputCommon::forced_output()
     return std::nullopt;
 }
 
+bool InputCommon::game_turned_low_latency_off()
+{
+    const bool reflexInput = activeInput.load() == LowLatencyInput::Reflex;
+    const bool setMode =
+        (sleep_modes_set.load(std::memory_order_relaxed) & (1u << static_cast<uint32_t>(LowLatencyInput::Reflex))) != 0;
+    const bool forceEnabled = Config::Instance()->FN_ForceReflex.value_or_default() == ForceReflex::ForceEnable;
+
+    return native::xefgreflex::GameTurnedLowLatencyOff(reflexInput, setMode,
+                                                       get_sleep_copy(LowLatencyInput::Reflex).low_latency_enabled,
+                                                       native::lowlatency::FrameGenerationNeedsReflex(), forceEnabled);
+}
+
 bool InputCommon::xefg_paced()
 {
     // OptiScaler's XeFG needs XeLL in low latency mode and knows its generated frames
@@ -1417,6 +1429,7 @@ SleepMode InputCommon::shaped_sleep_mode(lloutput::Role role)
                  native::lowlatency::GameLowLatencyBlocked();
     in.inputSetMode = (sleep_modes_set.load(std::memory_order_relaxed) & (1u << static_cast<uint32_t>(input))) != 0;
     in.modeForOtherSide = input == LowLatencyInput::OptiScaler && optiscaler_mode_side.load() != in.side;
+    in.gameTurnedOff = game_turned_low_latency_off();
 
     native::xefgreflex::SleepMode rule;
     rule.lowLatency = copy.low_latency_enabled;
@@ -1584,13 +1597,17 @@ void InputCommon::update()
         in.side = side;
         in.splitLimiterKeepsCap =
             native::lowlatency::SplitLimiterKeepsCap(side, state.swapchainInteropApi == SwapchainInteropApi::Dx11wDx12);
+        // Reflex off in the game: XeLL's sleeps are skipped (shaped_sleep_mode, the same answer), the limiter keeps
+        // the cap
         in.xellHoldsCap = native::xefgreflex::XellHoldsCap(
-            forceDisabled || blocked || side != lloutput::XefgLatency::XeLL, intelGpu,
-            native::lowlatency::XefgGenerating(), state.fgPresentVsync.load(std::memory_order_relaxed));
+            native::xefgreflex::XellSleepsOff(forceDisabled, blocked, game_turned_low_latency_off(),
+                                              side != lloutput::XefgLatency::XeLL),
+            intelGpu, native::lowlatency::XefgGenerating(), state.fgPresentVsync.load(std::memory_order_relaxed));
         in.fsrFgOutput = state.activeFgOutput == FGOutput::FSRFG;
         in.fgActive = state.CurrentFG() != nullptr && state.CurrentFG()->IsGenerating();
         in.blocked = blocked;
         in.xefgShownPerRendered = native::lowlatency::XefgShownPerRendered();
+        in.vkF5Low = state.activeFgOutput == FGOutput::F5Low && state.currentVkFG != nullptr;
         in.xellCountsShown = native::lowlatency::XellCountsShown();
         in.driverMultipliesCap = native::lowlatency::DriverMultipliesReflexCap();
         in.dlssgFramesToGenerate = ReflexHooks::dlssgFrameCountToGenerate();

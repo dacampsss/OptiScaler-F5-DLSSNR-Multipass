@@ -8,6 +8,8 @@
 // resources and fence points, never as pointers into the game's API, so the same contract works when the adapter lives in
 // another process (the 32-bit bridge) and the resources are shared handles. See docs/NATIVE-INPUT-ADAPTERS.md.
 
+#include "../dlssnr/DlssNr_FinishedGameFrame.h"
+
 #include <d3d12.h>
 #include <dxgi.h>
 #include <cstdint>
@@ -59,6 +61,16 @@ enum class DepthReadability
     Unknown
 };
 
+// The depth and the motion the game's own upscaler call was given, kept at that call (Finished Picture on a Vulkan
+// game, dlssnr/DlssNr_FinishedVk.h) and shared as D3D12 textures. Used instead of the producer's own: the picture is
+// then NR's input exactly as on a D3D12 game.
+struct GameGuides
+{
+    ID3D12Resource* depth = nullptr;  // R32_FLOAT at the game's allocation, null: no depth. Rests in COMMON.
+    ID3D12Resource* motion = nullptr; // R16G16B16A16_FLOAT (.xy) at the game's allocation. Rests in COMMON.
+    DlssNr::FinishedGameFrame frame;  // what the game's call said (reset, flags, sizes, subrects, MV scale)
+};
+
 struct FrameInput
 {
     static constexpr int kMaxDepthCopies = 8;
@@ -84,6 +96,10 @@ struct FrameInput
     uint32_t depthHeight = 0;
     bool depthReversed = false; // near is 1.0
     DepthReadability depthReadability = DepthReadability::Readable;
+
+    // The game's own guides for this picture, when the adapter has them (and the depth copies above are then empty).
+    bool hasGameGuides = false;
+    GameGuides game;
 
     bool cutHint = false; // the adapter knows this frame is not a continuation (a resize, a loading screen)
     SyncPoint ready;      // the producer waits on this before reading `picture` and `depth`

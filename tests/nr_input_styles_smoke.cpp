@@ -36,7 +36,7 @@ int main()
         s.structure = true;
         s.structureStrength = 9.0f;
         CHECK(Passes(s, p) == 2);
-        CHECK(p[0].style == kStyleSmoothCanvas && p[0].strength == 1.0f);
+        CHECK(p[0].style == kStyleSmoothCanvas && p[0].strength == 3.0f);
         CHECK(p[1].style == kStyleStructureHint && p[1].strength == 3.0f);
     }
 
@@ -47,6 +47,38 @@ int main()
         s.flattenStrength = 0.0f;
         s.structure = true;
         CHECK(Passes(s, p) == 1 && p[0].style == kStyleStructureHint);
+    }
+
+    // Runs: a smooth canvas above 1 is whole runs then the rest; the structure hint after them; at most kMaxRuns
+    {
+        Pass r[kMaxRuns];
+        Styles s;
+        s.flatten = kFlattenSmoothCanvas;
+        s.flattenStrength = 2.5f;
+        s.structure = true;
+        s.structureStrength = 2.0f;
+        CHECK(Runs(s, r) == 4);
+        CHECK(r[0].style == kStyleSmoothCanvas && r[0].strength == 1.0f && r[1].strength == 1.0f &&
+              r[2].style == kStyleSmoothCanvas && r[2].strength == 0.5f);
+        CHECK(r[3].style == kStyleStructureHint && r[3].strength == 2.0f);
+        s.structure = false;
+        s.flattenStrength = 3.0f;
+        CHECK(Runs(s, r) == 3 && r[2].strength == 1.0f);
+        s.flattenStrength = 2.001f; // a rest under 0.005 is no run
+        CHECK(Runs(s, r) == 2);
+        s.flattenStrength = 0.7f;
+        CHECK(Runs(s, r) == 1 && r[0].strength == 0.7f);
+        s.flatten = kFlattenWatercolour;
+        s.flattenStrength = 3.0f; // watercolour is bounded at 1 and runs once
+        CHECK(Runs(s, r) == 1 && r[0].strength == 1.0f);
+    }
+
+    // Watercolour is a blend: bounded at 1
+    {
+        Styles s;
+        s.flatten = kFlattenWatercolour;
+        s.flattenStrength = 2.5f;
+        CHECK(Passes(s, p) == 1 && p[0].style == kStyleWatercolour && p[0].strength == 1.0f);
     }
 
     // The old single key: each style maps to the card and back; 4 (the removed texture hint) and anything else is off

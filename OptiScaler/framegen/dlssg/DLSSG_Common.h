@@ -23,6 +23,10 @@ class DLSSG_Common : public virtual IFGFeature
     void PauseAfterError();
 
   public:
+    // The real DLSS-G's own estimate of the GPU memory it needs for this many generated frames (slDLSSGGetState with
+    // eRequestVRAMEstimate), logged once per count. Asked right after SetOptions; may need a few calls to be non-zero.
+    static void LogVramEstimate(const sl::ViewportHandle& viewport, unsigned int framesToGenerate);
+
     // IFGFeature
     const char* Name() override final { return "DLSSG"; }
     feature_version Version() override final;

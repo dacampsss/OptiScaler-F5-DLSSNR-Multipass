@@ -25,6 +25,9 @@ bool reset = true;
 // path cancels, and so sets `reset`, on every present while Finished Picture is off, which is how Optical F5Low's
 // "NR + frame generation" mode runs. Shared, it reset NR's history on every frame there: NR's edits flickered.
 bool nativeReset = true;
+// Capture epoch of the last picture NR ran on with a Vulkan game's own guides (ApplyFinishedGameGuides); 0: none yet
+// (FinishedHistoryGap), and again after a frame NR did not run on.
+uint64_t gameGuidesApplied = 0;
 
 // Native input's HDR10 scratch pair (no slot to keep it in): NR's linear scRGB picture and the PQ result in the picture's
 // own format. Recreated when the picture's size or format changes. A replaced buffer is kept until the frame number has
@@ -563,12 +566,16 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
         Config::Instance()->DlssNrColourEncoding.value_or_default(), screenPq || screenScrgb || screenSdr,
         screenPq ? Screen::Pq : screenScrgb ? Screen::Scrgb : Screen::Sdr,
         desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT,
-        desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
+        // BGRA too (RDR2 on D3D12, most 8-bit swapchains): with RGBA8, RGB10A2 and RGBA16F these are every format a
+        // flip-model swapchain can have. The pass reads the picture through views, which order the channels, and its
+        // scratch copies take the picture's own format, as for native input below.
+        desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM ||
+            desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
     DlssNr::ReportColourEncoding(screenChoice.choice, DiagFormatName(desc.Format), "finished picture", true);
     if (!screenChoice.supported)
     {
         Late::Cancel();
-        Late::Say("This screen colour format is not supported.");
+        Late::Say((std::string("This screen colour format is not supported (") + DiagFormatName(desc.Format) + ").").c_str());
         return;
     }
     const bool pq = screenChoice.screen == Screen::Pq;
@@ -793,6 +800,12 @@ void FinishedPictureUnavailable(const char* message)
     Late::Say(message);
 }
 
+void FinishedPictureNote(const char* message)
+{
+    std::lock_guard<std::recursive_mutex> lock(g_nrMutex);
+    Late::Say(message);
+}
+
 uint64_t BeginStreamlinePicture()
 {
     std::lock_guard<std::recursive_mutex> lock(g_nrMutex);
@@ -855,11 +868,14 @@ void ApplyToStreamlinePassthrough(IDXGISwapChain* swapchain, ID3D12CommandQueue*
 // calls). Neither refuses while frame generation has replaced a D3D11 or Vulkan game's swap chain: both then run from that
 // swap chain's present on the paired D3D12 queue, whose picture is the one presented. (The first NR Only read the game's
 // D3D12 swap chain at present, which under that interop is frame generation's, and so refused it.)
+// `game`: the picture is a Vulkan game's finished picture and `depth` and `motion` are the guides its own upscaler call was
+// given (ApplyFinishedGameGuides), at the game's allocation and resting in COMMON; the frame then carries the game's flags,
+// sizes, subrects and MV scale as the D3D12 capture's slot does (Late::Capture), and everything else is this function's.
 static bool ApplyFinishedPictureInput(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* cmd, ID3D12Resource* color,
                                       ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* historyDistrust,
                                       bool depthReversed, bool reset, DXGI_COLOR_SPACE_TYPE colorSpace,
                                       D3D12_RESOURCE_STATES pictureState, unsigned long long epoch,
-                                      bool fromVirtualUpscaler)
+                                      bool fromVirtualUpscaler, const FinishedGameFrame* game = nullptr)
 {
     std::lock_guard<std::recursive_mutex> lock(g_nrMutex);
     if ((!fromVirtualUpscaler && !Config::Instance()->DlssNrFinishedPicture.value_or_default()) ||
@@ -904,7 +920,7 @@ static bool ApplyFinishedPictureInput(ID3D12CommandQueue* queue, ID3D12GraphicsC
     DlssNr::ReportColourEncoding(screenChoice.choice, DiagFormatName(desc.Format), "native input", true);
     if (!screenChoice.supported)
     {
-        Late::Say("This screen colour format is not supported.");
+        Late::Say((std::string("This screen colour format is not supported (") + DiagFormatName(desc.Format) + ").").c_str());
         return false;
     }
     const bool pq = screenChoice.screen == Screen::Pq;
@@ -948,6 +964,43 @@ static bool ApplyFinishedPictureInput(ID3D12CommandQueue* queue, ID3D12GraphicsC
     // Optical F5Low measured the motion on this picture, so detail reuse may move detail with it.
     frame.MotionMatchesPicture = true;
     frame.HistoryDistrust = historyDistrust;
+    if (game)
+    {
+        // The game's own guides, described as the D3D12 capture describes them. The motion is the game's, rendered for its
+        // scene, not measured on this picture. A gap of more than two game frames between two applied pictures, or none
+        // applied yet, starts NR's history over, as FinishedHistoryGap does for the D3D12 slots.
+        if (game->outputWidth != desc.Width || game->outputHeight != desc.Height)
+        {
+            Late::Say("The game's upscaler output and the picture differ in size.");
+            return false;
+        }
+        // Which weights this pass builds its model from: the selector (DlssNr::Weights, [DlssNr] WeightsSetA / WeightsSetB) reaches the model at
+        // its creation on this device, as for any D3D12 game
+        static std::string saidWeights = "\x01";
+        const std::string weightsSet =
+            DlssNr::WeightsRules::BuiltKey(Config::Instance()->DlssNrWeightsSetA.value_or_default(),
+                                           Config::Instance()->DlssNrWeightsSetB.value_or_default());
+        if (saidWeights != weightsSet)
+        {
+            saidWeights = weightsSet;
+            LOG_INFO("DLSS-NR finished picture (Vulkan game): model weights {}",
+                     weightsSet == "|" ? std::string("stock") : "sets \"" + weightsSet + "\" (A|B)");
+        }
+        frame.DepthInverted = game->depthInverted;
+        frame.MvScaleX = game->mvScaleX;
+        frame.MvScaleY = game->mvScaleY;
+        frame.MotionVectorsLowResolution = game->mvLowRes;
+        frame.RayReconstruction = game->rayReconstruction;
+        frame.RenderSubrectWidth = game->renderWidth;
+        frame.RenderSubrectHeight = game->renderHeight;
+        frame.DepthSubrectBaseX = game->depthBaseX;
+        frame.DepthSubrectBaseY = game->depthBaseY;
+        frame.MotionSubrectBaseX = game->motionBaseX;
+        frame.MotionSubrectBaseY = game->motionBaseY;
+        frame.MotionMatchesPicture = false;
+        frame.HistoryDistrust = nullptr;
+        frame.Reset = game->reset || Late::nativeReset || FinishedHistoryGap(Late::gameGuidesApplied, game->captureEpoch, 1);
+    }
     frame.IndependentCommands = true;
     frame.OutputArrivalState = pictureState;
     // The first evaluate waits for the epoch to move past the frame the model was made on, and detail reuse numbers
@@ -975,14 +1028,32 @@ static bool ApplyFinishedPictureInput(ID3D12CommandQueue* queue, ID3D12GraphicsC
         frame.OutputArrivalState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
 
+    // A Vulkan game's guides come from images shared across APIs (resting in COMMON); the pass reads them as the D3D12
+    // capture's copies, which rest in NON_PIXEL_SHADER_RESOURCE
+    if (game)
+    {
+        if (depth)
+            Barrier(cmd, depth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(cmd, motion, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
     g_compose->Dispatch(cmd, nrColor, depth, motion, nrColor, frame, queue);
     const bool ran = g_nr.successfulDispatches > before;
 
     if (pq && ran && Config::Instance()->DlssNrApplyModel.value_or_default())
         RecordPqEncode(cmd, nrColor, color, pictureState, Late::nativeHdr.encoded.Get(), conversion);
 
+    if (game)
+    {
+        if (depth)
+            Barrier(cmd, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(cmd, motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        if (ran)
+            Late::gameGuidesApplied = game->captureEpoch;
+    }
+
     Late::nativeReset = !ran;
     Late::Say(!Config::Instance()->DlssNrApplyModel.value_or_default() ? "NR changes are hidden." :
+        game ? (ran ? "Applying NR to the finished picture." : "Preparing NR for the finished picture.") :
         ran ? "Applying NR to the finished picture (native input)." : "Preparing NR for the finished picture (native input).");
     if (ran && (++Late::successes == 1 || Late::successes % 300 == 0))
         LOG_INFO("DLSS-NR {}: {} frames, {}x{}", fromVirtualUpscaler ? "on the virtual upscaler's picture" : "native input",
@@ -994,6 +1065,19 @@ void NativeInputSkipped()
 {
     std::lock_guard<std::recursive_mutex> lock(g_nrMutex);
     Late::nativeReset = true;
+    Late::gameGuidesApplied = 0;
+}
+
+bool ApplyFinishedGameGuides(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* cmd, ID3D12Resource* color,
+                             ID3D12Resource* depth, ID3D12Resource* motion, const FinishedGameFrame& game,
+                             DXGI_COLOR_SPACE_TYPE colorSpace, D3D12_RESOURCE_STATES pictureState,
+                             unsigned long long epoch)
+{
+    const bool ran = ApplyFinishedPictureInput(queue, cmd, color, depth, motion, nullptr, game.depthInverted, game.reset,
+                                               colorSpace, pictureState, epoch, false, &game);
+    if (!ran)
+        NativeInputSkipped();
+    return ran;
 }
 
 bool ApplyNativeInput(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* cmd, ID3D12Resource* color,

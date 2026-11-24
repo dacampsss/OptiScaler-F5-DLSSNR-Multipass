@@ -127,6 +127,15 @@ void Collect()
 {
     std::erase_if(retired, [](const auto& g) { return g->Idle(); });
 }
+// Neural Rendering switched off for a while (DlssNr_Dx12.cpp ReleaseWhileOff): the generation's own NGX feature and
+// surfaces go to the retired list, freed once its GPU work is done. Called on every evaluate while off, so Collect runs.
+void ReleaseWhileOff()
+{
+    pending = {};
+    if (current)
+        retired.push_back(std::move(current));
+    Collect();
+}
 
 unsigned UInt(NVSDK_NGX_Parameter* p, const char* key, unsigned fallback = 0)
 {

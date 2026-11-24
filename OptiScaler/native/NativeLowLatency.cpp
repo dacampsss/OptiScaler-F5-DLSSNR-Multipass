@@ -332,6 +332,7 @@ CapInputs FrameCapInputs(Api api)
     in.shownPerRendered = XefgShownPerRendered();
     in.xellCountsShown = XellCountsShown();
     in.driverMultipliesCap = DriverMultipliesReflexCap();
+    in.vkF5Low = state.activeFgOutput == FGOutput::F5Low && state.currentVkFG != nullptr;
     in.xefgVsync = state.fgPresentVsync.load(std::memory_order_relaxed);
     in.fakenvapiXell = in.method == Method::Fakenvapi && InputCommon::current_mode() == LowLatencyMode::XeLL;
 
@@ -1037,6 +1038,11 @@ bool DriverMultipliesReflexCap() { return XeFGProxy::DriverMultipliesReflexCap()
 
 uint32_t XefgShownPerRendered()
 {
+    // F5Low on a native Vulkan swapchain (framegen/f5low/F5Low_Vk.h): its frames per rendered one count the same way
+    if (const auto& state = State::Instance(); state.activeFgOutput == FGOutput::F5Low && state.currentVkFG != nullptr)
+        return ShownPerRendered(state.currentVkFG->IsGenerating() && !state.realExclusiveFullscreen,
+                                state.currentVkFG->GetInterpolatedFrameCount());
+
     const auto fg = State::Instance().currentFG;
     return ShownPerRendered(XefgGenerating() && fg != nullptr, fg != nullptr ? fg->GetInterpolatedFrameCount() : 0);
 }
@@ -1051,6 +1057,9 @@ Status GetStatus()
     // In the split XeLL only keeps XeFG running: the game's Reflex lowers latency on the other side
     status.gameReflexFeedsXell = ReflexHooks::gameReflexFeedsXell() && status.xefgSide == XefgLatency::XeLL;
     status.forceReflexDisabled = ForceReflexDisabled();
+
+    status.gameReflexOff = InputCommon::game_turned_low_latency_off();
+
     const auto current = CurrentDevice();
     status.output = OutputText(current.api);
     status.offKeptForFrameGeneration =

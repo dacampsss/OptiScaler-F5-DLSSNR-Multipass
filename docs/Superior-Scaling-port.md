@@ -47,11 +47,16 @@ model-mapping update.
 Gains use the v59 resolution correction and Structure * Intensity. High/medium multiply within a block; low is the block's arithmetic mean.
 An inter-pass runs before the next pass only if the absolute high/low gap would both increase and exceed 0.15.
 Final shaping uses only the tail after the last successful inter-pass. Carrier K=1, fixed linear 0.5 encoding, guided radius 1, range sigma .015, spatial sigma 3, strength 1.
-No K/headroom analysis is introduced. Native Vulkan is outside the original v59 implementation; DirectX 12 and supported D3D12 bridges are required.
+No K/headroom analysis is introduced. Native Vulkan runs the same composition from the same shader sources (built for Vulkan), below 100% Model resolution and, with CNN or Transformer, at 100% and above.
 
 ### When Superior cannot run
 
-Superior runs on DirectX 12 and compatible bridges. Native Vulkan falls back to Matched residual.
+Superior runs on DirectX 12, compatible bridges and native Vulkan (No DLSS, CNN and Transformer). On native Vulkan it
+works below 100% with any of the three, and at 100% and above with CNN or Transformer under **Also at 100% and above**
+(above 100% the ordinary down-leg averages to native first). It needs one NR pass, no Compress screen edges and no Reuse detail that is actually running;
+in those cases, and where its passes cannot be built or fail, Matched residual runs instead and the menu says why. If
+only the private DLSS's passes cannot be built, Superior runs like **No DLSS**. The CNN on Vulkan picks D or E and
+swaps in still scenes like on DirectX 12 (resident E, motion probe, fade).
 With **No DLSS**, the current NR answer supplies the guided reconstruction directly, including when it is packed.
 CNN uses D or E under the existing guided range rule. When D is selected and E is resident, the camera motion probe
 checks 576 vectors against 0.1 pixel per 60 Hz frame in 1080p-height units (about 6 pixels per second at any frame

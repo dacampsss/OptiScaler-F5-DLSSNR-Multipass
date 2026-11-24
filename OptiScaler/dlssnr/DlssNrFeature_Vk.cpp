@@ -3,6 +3,7 @@
 
 #include "DlssNrFeature_Vk.h"
 #include "DlssNrFeature_Dx12.h"
+#include "DlssNr_FinishedVk.h"
 #include "PassProfiles.h"
 
 #include <Config.h>
@@ -32,11 +33,19 @@
 #include <dlssnr/DlssNrDetailReuseHost.h>
 #include <shaders/dlssnr/DlssNrDetailReuse_Vk.h>
 #include <shaders/dlssnr/DlssNrSpatial_Vk.h>
+#include <shaders/dlssnr/DlssNrSuperior_Vk.h>
+#include <shaders/dlssnr/superior/Fields.h>
+#include "DlssNr_SuperiorGains.h"
+#include "DlssNr_SuperiorVkRule.h"
+#include "DlssNr_SuperiorPrivatePolicy.h"
+#include <proxies/NVNGX_Proxy.h>
+#include <native/VkPresentBridge.h>
 #include <shaders/dlssnr/DlssNr_Spatial.h>
 #include <shaders/output_scaling/OS_Vk.h>
 #include <shaders/sgsr1/SGSR1_Vk.h>
 
 #include <dlssnr/DlssNr_RetryRequest.h>
+#include <dlssnr/DlssNr_Weights.h>
 
 #include <algorithm>
 #include <chrono>
@@ -103,6 +112,11 @@ struct VkState
     PFN_VkForget forget = nullptr;
     PFN_VkSetFloatSlot setFloatSlot = nullptr;
     PFN_VkProbeFloat probeFloat = nullptr;
+    // Model weights selector (optional: forwarders before it lack both). All passes are built from one set.
+    DlssNr::Weights::Exports weightsSelect;
+    DlssNr::Weights::TakeLogFn weightsTakeLog = nullptr;
+    std::string builtWeightsSet; // A|B, see DlssNr::WeightsRules::BuiltKey
+    std::string builtWeightsSetA, builtWeightsSetB;
     bool floatSlotKnown = false;
 
     VkInstance instance = VK_NULL_HANDLE;
@@ -192,6 +206,9 @@ struct VkState
     float timestampPeriod = 0.0f;
     unsigned long long timedFrames = 0;
     std::optional<double> lastGpuTime;
+    std::atomic<long long> lastGpuTimeAtMs {
+        0
+    }; // SteadyMs() when lastGpuTime was measured (the menu shows only a fresh one)
 
     // Whether the game hands over an exposure texture, and what it said when it did.
     bool exposureOffered = false;
@@ -283,6 +300,22 @@ constexpr uint32_t kTimingSlots = 4;
 
 VkState g_vk;
 std::mutex g_vkMutex;
+
+// When the native Vulkan path last came through the seam (EvaluateAtSeamVk), in milliseconds of the steady clock; 0
+// before the first. The game's Vulkan route can move Neural Rendering to the D3D12 bridge at run time, after which this
+// path is never entered again but g_vk.feature stays; IsRunningVk reads this to tell the two apart.
+std::atomic<long long> g_vkSeamStamp { 0 };
+// The seam call (g_vkSeamCalls) on which the device was last drained, so the several places that free images after a
+// size change drain it once, not once each. ~0 before the first.
+unsigned long long g_vkDrainedAt = ~0ull;
+unsigned long long g_vkSeamCalls = 0; // EvaluateAtSeamVk entries (g_vk.frames only counts the ones that evaluate)
+constexpr long long kVkSeamStaleMs = 1000;
+
+long long SteadyMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 // Set while this thread holds g_vkMutex in the evaluate path. A device or NGX shutdown reached from inside it (the
 // model, the NGX core) must not take the lock again.
@@ -601,6 +634,8 @@ bool LoadForwarder()
     g_vk.forget = (PFN_VkForget) GetProcAddress(g_vk.forwarder, "dlssnr_vk_forget");
     g_vk.setFloatSlot = (PFN_VkSetFloatSlot) GetProcAddress(g_vk.forwarder, "dlssnr_call_set_float_slot");
     g_vk.probeFloat = (PFN_VkProbeFloat) GetProcAddress(g_vk.forwarder, "dlssnr_call_probe_float");
+    DlssNr::Weights::Load(g_vk.weightsSelect, g_vk.forwarder);
+    g_vk.weightsTakeLog = (DlssNr::Weights::TakeLogFn) GetProcAddress(g_vk.forwarder, "dlssnr_weights_take_log");
 
     if (g_vk.init == nullptr || g_vk.create == nullptr || g_vk.evaluate == nullptr)
     {
@@ -694,6 +729,8 @@ std::optional<std::filesystem::path> FindSnippet()
 #include "DlssNr_ExposureCalibrate_Vk.inl"
 #include "DlssNr_DetailReuse_Vk.inl"
 #include "DlssNr_Spatial_Vk.inl"
+#include "DlssNr_Superior_Vk.inl"
+#include "DlssNr_SuperiorPrivate_Vk.inl"
 
 // The game's depth for the resolve's depth fade (shaders/dlssnr/DlssNr_DepthFade.h). Read as a sampled image in
 // SHADER_READ_ONLY_OPTIMAL and never moved, as the detail reuse and Compress screen edges read it, through a depth-only
@@ -764,7 +801,31 @@ void Release(bool deviceAlive)
 
 void ReleaseNrObjects(); // below, with ShutdownVk
 
-bool IsRunningVk() { return g_vk.feature != nullptr && !g_vk.failed; }
+// Native Vulkan Neural Rendering is up. Not merely "its model exists": after a switch to the Vulkan bridge route the
+// model stays (g_vk.feature is released only with the device or on Retry/off), but NR runs on the bridge's D3D12
+// device, and the menu has to show that route's controls. That is told by the seam going quiet WHILE a bridge is up; a
+// native Vulkan game that stops calling DLSS for a while (a menu, a loading screen) has no bridge and stays native.
+bool IsRunningVk()
+{
+    if (g_vk.feature == nullptr || g_vk.failed)
+        return false;
+
+    // With Finished Picture on and NR enabled, NR on a Vulkan game is the D3D12 engine on the private device
+    // (native/NativeDriverVk.cpp); a Vulkan model that is still alive (released after the off delay) is not what runs,
+    // and its controls, time and status are not the ones in effect
+    {
+        const auto& cfg = *Config::Instance();
+
+        if (cfg.DlssNrFinishedPicture.value_or_default() && cfg.DlssNrEnabled.value_or_default())
+            return false;
+    }
+
+    const long long stamp = g_vkSeamStamp.load(std::memory_order_relaxed);
+    if (stamp == 0)
+        return false;
+
+    return !(SteadyMs() - stamp > kVkSeamStaleMs && VkPresentBridge::IsUp());
+}
 
 const char* FailureReasonVk() { return g_vk.failed ? g_vk.reason : ""; }
 
@@ -815,11 +876,23 @@ ExposureStatus GameExposureStatusVk()
     return s;
 }
 
-std::optional<double> LastGpuTimeVk() { return g_vk.lastGpuTime; }
+// Only a time measured in the last 2 s: the model can linger (kOffReleaseVk) with nothing evaluating it, as while
+// Finished Picture runs the D3D12 engine on a Vulkan game, and its last number would be shown as if it were live.
+std::optional<double> LastGpuTimeVk()
+{
+    if (SteadyMs() - g_vk.lastGpuTimeAtMs.load(std::memory_order_relaxed) > 2000)
+        return std::nullopt;
+
+    return g_vk.lastGpuTime;
+}
 
 DetailReuseInfo DetailReuseStatusVk() { return DetailReuseVk::Published(); }
 
 Spatial::Published EdgeCompressionStatusVk() { return EdgeCompressionVk::Published(); }
+
+std::string SuperiorStatusVk() { return SuperiorVk::Status(); }
+
+bool SuperiorSrUnavailableVk() { return SuperiorVk::Private::srUnavailable.load(); }
 
 unsigned long long VkFrameClock()
 {
@@ -924,6 +997,48 @@ static void ApplyPostLutVk(VkCommandBuffer cmdBuffer, VkDevice device, VkPhysica
     DlssNr::ReportPostLutStatus(status);
 }
 
+// Neural Rendering switched off: after kOffReleaseVk off, everything NR made goes (the models, images and passes), as
+// the D3D12 path does (DlssNr_Dx12.cpp ReleaseWhileOff). Vulkan has no per-frame retired list here, so it is the
+// retry's release: wait for the device once, then ReleaseNrObjects. That one wait happens while NR is off; a quick
+// off/on within kOffReleaseVk frees nothing and stays instant. The next frame with NR on rebuilds as after a retry.
+constexpr auto kOffReleaseVk = std::chrono::seconds(10);
+// Both under g_vkMutex. offSince is zero while on; tried makes it one release (one device wait) per off period, also
+// when the wait fails, so a device that will not go idle is not asked again every frame.
+std::chrono::steady_clock::time_point g_vkOffSince {};
+bool g_vkOffReleaseTried = false;
+
+static void ReleaseWhileOffVk()
+{
+    std::lock_guard<std::mutex> lock(g_vkMutex);
+    VkLockMark lockMark;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (g_vkOffSince == std::chrono::steady_clock::time_point {})
+        g_vkOffSince = now;
+    if (g_vkOffReleaseTried || now - g_vkOffSince < kOffReleaseVk || g_vk.device == VK_NULL_HANDLE)
+        return;
+    g_vkOffReleaseTried = true;
+
+    // The same wait the menu's Retry makes on this thread before ReleaseNrObjects; here it runs once, while NR is off.
+    if (vkDeviceWaitIdle(g_vk.device) != VK_SUCCESS)
+    {
+        LOG_WARN(
+            "DLSS-NR Vulkan: switched off, but the device would not go idle; its models stay until it is on again");
+        return;
+    }
+
+    ReleaseNrObjects();
+    LOG_INFO("DLSS-NR Vulkan: switched off for {} s, its models and surfaces released",
+             std::chrono::duration_cast<std::chrono::seconds>(kOffReleaseVk).count());
+}
+
+static void NoteOnVk()
+{
+    std::lock_guard<std::mutex> lock(g_vkMutex);
+    g_vkOffSince = {};
+    g_vkOffReleaseTried = false;
+}
+
 static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* params, VkInstance instance,
                              VkPhysicalDevice physicalDevice, VkDevice device, bool beforeSr, bool rayReconstruction,
                              bool& applied, bool* handled = nullptr)
@@ -940,23 +1055,42 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
                      "native Vulkan leaves the clean SR frame unchanged");
             warnedDeferred = true;
         }
+
+        // Finished Picture says why it does not run with it (the capture refuses, and the status line shows the reason)
+        if (cfg.DlssNrFinishedPicture.value_or_default() && cfg.DlssNrEnabled.value_or_default() && !beforeSr)
+            DlssNr::FinishedVk::Capture(cmdBuffer, params, physicalDevice, device, rayReconstruction);
+
         return;
     }
 
+    ++g_vkSeamCalls;
+    // The native Vulkan path is the one running NR (menu: IsRunningVk); it stays so while NR is switched off, until the
+    // off release lets the model go (kOffReleaseVk).
+    g_vkSeamStamp.store(SteadyMs(), std::memory_order_relaxed);
+
     if (!cfg.DlssNrEnabled.value_or_default())
+    {
+        ReleaseWhileOffVk();
         return;
+    }
 
     if (cfg.DlssNrFinishedPicture.value_or_default())
     {
-        // Finished-picture composition requires a native D3D12 swapchain; say so where the post-NR stack is shown.
-        DlssNr::PostLutStatus status;
-        status.wanted = std::any_of(cfg.DlssNrPostLutFile, cfg.DlssNrPostLutFile + Config::kPostLutLayers,
-                                    [](const auto& file) { return !file.value_or_default().empty(); });
-        if (status.wanted)
-            status.note = "Not applied: Finished Picture mode does not run NR on Vulkan.";
-        DlssNr::ReportPostLutStatus(status);
+        // The native Vulkan model, and Superior Vulkan, may have been built before Finished Picture was switched on:
+        // they are not used any more, so they go after the usual off delay (not NoteOnVk: this is the "not running"
+        // clock)
+        ReleaseWhileOffVk();
+
+        // Finished Picture on a native Vulkan game: NR runs on the finished picture at present, on the private D3D12
+        // device the picture is shared with (native/NativeDriverVk.cpp), through the same pass as the D3D12 Finished
+        // Picture and with its post-NR stack. So the Vulkan model is not built here (one NR model only): this call
+        // keeps the depth and motion the game gave its upscaler, for that present (dlssnr/DlssNr_FinishedVk.h). Only
+        // after Super Resolution (the pre-SR call of "Before Super Resolution" is refused with the capture's status).
+        if (!beforeSr)
+            DlssNr::FinishedVk::Capture(cmdBuffer, params, physicalDevice, device, rayReconstruction);
         return;
     }
+    NoteOnVk();
 
     if (cmdBuffer == VK_NULL_HANDLE || params == nullptr || device == VK_NULL_HANDLE ||
         physicalDevice == VK_NULL_HANDLE)
@@ -1429,6 +1563,10 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         profileChanged |= g_vk.builtTuning[pass] != Profiles::PassTuning(cfg, pass) ||
                           g_vk.builtPreset[pass] != Profiles::PassPreset(cfg, pass) ||
                           g_vk.builtStyle[pass] != Profiles::PassStyle(cfg, pass);
+    // A new weight set rebuilds every pass (an older forwarder cannot serve one: no rebuild for nothing)
+    profileChanged |= g_vk.weightsSelect.Available() &&
+                      g_vk.builtWeightsSet != DlssNr::WeightsRules::BuiltKey(cfg.DlssNrWeightsSetA.value_or_default(),
+                                                                             cfg.DlssNrWeightsSetB.value_or_default());
     if (g_vk.width != width || g_vk.height != height || g_vk.workWidth != modelWidth ||
         g_vk.workHeight != modelHeight || g_vk.beforeSr != beforeSr ||
         g_vk.rayReconstruction != rayReconstruction || profileChanged ||
@@ -1442,7 +1580,10 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         // on RDR2 and Enshrouded by dragging the model-resolution slider). Drain the device first.
         // Only the rare resize path reaches here, so the CPU stall is a one-off hitch, not per-frame.
         if (g_vk.device != VK_NULL_HANDLE)
+        {
             vkDeviceWaitIdle(g_vk.device);
+            g_vkDrainedAt = g_vkSeamCalls;
+        }
 
         if (g_vk.feature != nullptr && g_vk.release != nullptr)
         {
@@ -1526,6 +1667,9 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
             g_vk.builtPreset[pass] = Profiles::PassPreset(cfg, pass);
             g_vk.builtStyle[pass] = Profiles::PassStyle(cfg, pass);
         }
+        g_vk.builtWeightsSetA = cfg.DlssNrWeightsSetA.value_or_default();
+        g_vk.builtWeightsSetB = cfg.DlssNrWeightsSetB.value_or_default();
+        g_vk.builtWeightsSet = DlssNr::WeightsRules::BuiltKey(g_vk.builtWeightsSetA, g_vk.builtWeightsSetB);
         g_vk.reset = true;
     }
 
@@ -1536,10 +1680,12 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         if (feature)
             continue;
         const auto tuning = Profiles::PassTuning(cfg, pass);
+        DlssNr::Weights::Select(g_vk.weightsSelect, g_vk.builtWeightsSetA, g_vk.builtWeightsSetB, " Vulkan");
         feature = g_vk.create((void*) cmdBuffer, g_vk.capabilityParams, modelWidth, modelHeight,
                              (int) Profiles::PassPreset(cfg, pass), tuning.intensity,
                              (int) Profiles::PassStyle(cfg, pass), tuning.structure, tuning.tone,
                              tuning.skin, tuning.autoMask ? 1 : 0, 1);
+        DlssNr::Weights::LogReads(g_vk.weightsTakeLog, " Vulkan");
         if (!feature)
         {
             Fail("the model would not build a feature on this device");
@@ -1800,14 +1946,12 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     encode.ModelWorkScale = (reduced && workScale < 1.0f) ? workScale : 1.0f;
     encode.MaxRatio = std::clamp(cfg.DlssNrMaxRatio.value_or_default(), 1.0f, 8.0f);
     encode.Transfer = cfg.DlssNrTransfer.value_or_default();
-    // Superior Scaling is D3D12-only (its private DLSS and PSOs). Native Vulkan runs Matched residual instead, said once.
+    // The composition shader knows Classic, Matched and NVIDIA residual only. Superior Scaling's own passes
+    // (DlssNr_Superior_Vk.inl) fix their transfer when they are built; every frame with it selected that they do not
+    // run (100% and above, Compress screen edges, more passes, Reuse detail, a pass that would not build) runs Matched
+    // residual, and the line under the Upscale Mode combo says why.
     if (DlssNr::SuperiorScaling::Enabled(encode.Transfer))
-    {
-        static std::once_flag warned;
-        std::call_once(warned, []
-                       { LOG_WARN("Superior Scaling needs DirectX 12 or a DirectX 12 bridge; Vulkan uses Matched residual"); });
         encode.Transfer = DlssNr::SuperiorScaling::FallbackTransfer;
-    }
     // Tone-mapped frames keep the Paper white scale; a linear HDR frame is shown at its base white point, or at the
     // white point in force when no exposure is known yet.
     encode.DebugScale = !linearHdr                ? cfg.DlssNrWhitePointScale.value_or_default()
@@ -2213,6 +2357,52 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
 
     CalibrationVkCopyInput(cmdBuffer, width, height);
 
+    // Superior Scaling (DlssNr_Superior_Vk.inl): whether its No DLSS composition runs this frame, and says why not when
+    // it does not. It replaces the ordinary downsample, guides and resolve below; everything else is the ordinary path.
+    // A Superior dispatch that fails below gives it up (SuperiorVk::GiveUp) and the frame goes on with the ordinary
+    // step, so it is not const.
+    // [DlssNr] SuperiorAtNative, as D3D12 (DlssNr_Dx12.cpp): the private DLSS at 100% and above. Above 100% it works at
+    // native, on the pair after the supersample down-leg, while the model keeps its supersampled raster and its
+    // ordinary guides; Superior's own raster (images, matched guides, the private DLSS) is then the frame's.
+    const bool superiorAtNativeWanted = DlssNr::SuperiorScaling::Enabled(cfg) &&
+                                        DlssNr::SuperiorScaling::StabilizeAtNative(
+                                            cfg.DlssNrSuperiorAtNative.value_or_default(), workScale, spatial,
+                                            cfg.DlssNrSuperiorScalingPreset.value_or_default(),
+                                            SuperiorVk::Private::srUnavailable || SuperiorVk::Private::privateBroken);
+    // Above 100% Superior needs the ordinary down-leg to average the supersampled answer to native. Its scaler and the
+    // native image are made here when they can be, so that where the down-leg cannot run this is known before anything
+    // of Superior's is decided or recorded (status, history, guides), not after.
+    bool downLegReady = true;
+    if (superiorAtNativeWanted &&
+        DlssNr::SuperiorScaling::StabilizeSupersampled(true, width, height, workWidth, workHeight))
+    {
+        const Scaler downScaler = cfg.DlssNrScalingDownscaler.value_or_default();
+        if (g_vk.nrScaler == downScaler && !g_vk.superDown)
+            g_vk.superDown =
+                std::make_unique<OS_Vk>("DLSS-NR VK supersample down", device, physicalDevice, false, downScaler);
+        // (a changed scaler is rebuilt by the up-leg below, which cannot fail the way this can)
+        downLegReady =
+            g_vk.outputNative.Valid() && (g_vk.nrScaler != downScaler || (g_vk.superDown && g_vk.superDown->IsInit()));
+    }
+    const bool superiorAtNative = superiorAtNativeWanted && downLegReady;
+    const bool superiorSupersample =
+        DlssNr::SuperiorScaling::StabilizeSupersampled(superiorAtNative, width, height, workWidth, workHeight);
+    const uint32_t superiorW = superiorSupersample ? width : workWidth;
+    const uint32_t superiorH = superiorSupersample ? height : workHeight;
+    bool superiorRuns =
+        SuperiorVk::Begin(cmdBuffer, cfg, device, physicalDevice, workWidth < width || workHeight < height,
+                          superiorAtNative, spatial, passes, superiorW, superiorH,
+                          superiorSupersample ? SuperiorVk::Raster::Supersampled
+                          : superiorAtNative
+                              ? SuperiorVk::Raster::Native
+                              : SuperiorVk::Raster::Model) == DlssNr::SuperiorScaling::VkRule::Outcome::Runs;
+    // Another kind of picture and guides for the model from here (or back): its history starts over, as on D3D12.
+    if (superiorRuns != SuperiorVk::wasRunning)
+    {
+        SuperiorVk::wasRunning = superiorRuns;
+        g_vk.reset = true;
+    }
+
     // The model's input: the full proxy, or a downsampled copy of it when the working scale is below
     // the frame. Mirrors the D3D12 path -- the encode always writes a full proxy, and a separate
     // downsample makes the small one the model actually reads.
@@ -2277,7 +2467,18 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
             Transition(cmdBuffer, g_vk.proxy, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             Transition(cmdBuffer, g_vk.proxySmall, VK_IMAGE_LAYOUT_GENERAL);
 
-            if (!g_vk.pass->Dispatch(cmdBuffer, down, workWidth, workHeight, g_vk.proxy.view, VK_NULL_HANDLE,
+            bool downsampled = false;
+            if (superiorRuns && !superiorSupersample)
+            {
+                downsampled = SuperiorVk::Area(cmdBuffer, g_vk.proxy, g_vk.proxySmall, workWidth, workHeight);
+                if (!downsampled)
+                {
+                    SuperiorVk::GiveUp("its Area downsample failed");
+                    superiorRuns = false;
+                }
+            }
+            if (!downsampled &&
+                !g_vk.pass->Dispatch(cmdBuffer, down, workWidth, workHeight, g_vk.proxy.view, VK_NULL_HANDLE,
                                      VK_NULL_HANDLE, VK_NULL_HANDLE, g_vk.proxySmall.view, VK_NULL_HANDLE,
                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))
             {
@@ -2424,18 +2625,62 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         mvY *= (float) workHeight / height;
     }
 
-    // Experimental input styles (Config.h DlssNrInputFlatten ..., DlssNr_InputStyles.h), as on D3D12: restyle the model's
-    // picture once it is final (after the shrink and the edge packing), each style that is on in turn, each on the one
-    // before's result, alternating between two images. The last result stands in for the model input and the resolve's
-    // proxy (ordinaryProxy below, and through the edge unpacking), so Composed hands back only what the model painted on
-    // top of it. Skipped above 100% model resolution, where the resolve compares against the full proxy instead.
+    // Superior Scaling hands the model the game's depth and motion matched to its own raster (as D3D12 does,
+    // SuperiorRun::MatchGuides), with the vector scale taken from the matched grid.
+    bool superiorMatched = false;               // the model takes Superior's matched guides
+    bool superiorGuidesReady = false;           // Superior's matched guides exist (the private DLSS takes them)
+    float superiorMvX = 1.f, superiorMvY = 1.f; // the matched guides' vector scale, for the private DLSS
+    if (superiorRuns)
+    {
+        const DlssNr::GuideExtent reference = (createFlags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0
+                                                  ? DlssNr::GuideExtent { renderWidth, renderHeight }
+                                                  : DlssNr::GuideExtent { outputWidth, outputHeight };
+
+        if (SuperiorVk::MatchGuides(cmdBuffer, device, depth, motion, guides, width, height, superiorW, superiorH,
+                                    depthInverted, gameMvX, gameMvY, reference))
+        {
+            superiorGuidesReady = true;
+            superiorMvX =
+                DlssNr::SuperiorScaling::MotionScale(gameMvX, superiorW, reference.width, guides.motion.width);
+            superiorMvY =
+                DlssNr::SuperiorScaling::MotionScale(gameMvY, superiorH, reference.height, guides.motion.height);
+            // Supersampling under SuperiorAtNative: the matched guides are the private DLSS's native ones, not the
+            // model's (it keeps its ordinary guides and vector scale).
+            if (!superiorSupersample)
+            {
+                superiorMatched = true;
+                modelDepth = &SuperiorVk::depth.ngx;
+                mvX = superiorMvX;
+                mvY = superiorMvY;
+            }
+        }
+        else
+        {
+            // The model gets the ordinary guides this frame and the ordinary composition follows.
+            SuperiorVk::GiveUp("its guide dispatch failed");
+            superiorRuns = false;
+        }
+    }
+    // The guides the model gets are ours at the model's raster: Compress screen edges' packed ones or Superior's
+    // matched ones.
+    const bool ownGuides = spatial || superiorMatched;
+
+    // Experimental input styles (Config.h DlssNrInputFlatten ..., DlssNr_InputStyles.h), as on D3D12: restyle the
+    // model's picture once it is final (after the shrink and the edge packing), each style that is on in turn, each on
+    // the one before's result, alternating between two images. The last result stands in for the model input and the
+    // resolve's proxy (ordinaryProxy below, and through the edge unpacking), so Composed hands back only what the model
+    // painted on top of it. Above 100% model resolution it runs with Compress screen edges (the resolve's proxy is
+    // unpacked from the model input, so both sides agree); without it the resolve compares against the full native
+    // proxy instead, so it is skipped there (D3D12 styles the native picture before the enlarge; not yet here).
     bool inputRestyled = false;
     {
         const DlssNrInput::Styles styles = cfg.DlssNrInputStyles();
-        DlssNrInput::Pass passes[2];
-        const int passCount = DlssNrInput::Passes(styles, passes);
+        DlssNrInput::Pass passes[DlssNrInput::kMaxRuns];
+        const int passCount = DlssNrInput::Runs(styles, passes);
 
-        const char* skip = passCount == 0 ? nullptr : workScale > 1.0f ? "model resolution above 100%" : nullptr;
+        const char* skip = passCount == 0                 ? nullptr
+                           : workScale > 1.0f && !spatial ? "model resolution above 100% without Compress screen edges"
+                                                          : nullptr;
         int ran = 0;
 
         if (passCount > 0 && skip == nullptr)
@@ -2559,7 +2804,9 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     reuseFrame.modelReset = g_vk.reset;
     reuseFrame.edgeCompression = spatial; // the two do not run together; Reuse detail says so in the menu
     // A Tune step pins the white point; a Measure detail run measures Reuse bottleneck as it runs.
-    reuseFrame.blocked = calibrationPinned;
+    // Superior's composition has the frame this time (Begin decided that from Reuse detail's last gate), so the two
+    // never run together even where the gate flips between the two reads.
+    reuseFrame.blocked = calibrationPinned || superiorRuns;
     reuseFrame.vulkan = true;
     reuseFrame.present = VkFrameClock();
     // NR's own frames, which step exactly once per evaluate: the present count is read on this thread while presents
@@ -2613,15 +2860,14 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
                                     (long long) (g_vk.frames & 0x3FFFFFFFFFFFFFFFull), nullptr, false,
                                     DlssNrVitReuse::kCopyPlain | DlssNrVitReuse::kCopyFp8);
         evaluated = g_vk.evaluate(
-            (void*) cmdBuffer, passFeature, g_vk.capabilityParams,
-            &input->ngx, modelDepth, spatial ? modelMotion : reusePlan.motion, &answer->ngx, modelWidth, modelHeight,
-            spatial ? modelWidth : guideWidth, spatial ? modelHeight : guideHeight,
-            spatial ? modelWidth : guides.motion.width, spatial ? modelHeight : guides.motion.height,
-            spatial ? 0u : guides.depth.x, spatial ? 0u : guides.depth.y,
-            spatial ? 0u : reusePlan.motionBaseX, spatial ? 0u : reusePlan.motionBaseY, depthInverted ? 1 : 0,
-            passReset ? 1 : 0, tuning.intensity,
-            (int) Profiles::PassStyle(cfg, pass), tuning.structure, tuning.tone, tuning.skin,
-            tuning.autoMask ? 1 : 0, mvX, mvY);
+            (void*) cmdBuffer, passFeature, g_vk.capabilityParams, &input->ngx, modelDepth,
+            superiorMatched ? &SuperiorVk::motion.ngx : (spatial ? modelMotion : reusePlan.motion), &answer->ngx,
+            modelWidth, modelHeight, ownGuides ? modelWidth : guideWidth, ownGuides ? modelHeight : guideHeight,
+            ownGuides ? modelWidth : guides.motion.width, ownGuides ? modelHeight : guides.motion.height,
+            ownGuides ? 0u : guides.depth.x, ownGuides ? 0u : guides.depth.y, ownGuides ? 0u : reusePlan.motionBaseX,
+            ownGuides ? 0u : reusePlan.motionBaseY, depthInverted ? 1 : 0, passReset ? 1 : 0, tuning.intensity,
+            (int) Profiles::PassStyle(cfg, pass), tuning.structure, tuning.tone, tuning.skin, tuning.autoMask ? 1 : 0,
+            mvX, mvY);
         if (DlssNrNative::EndEvaluate(nullptr))
             LOG_WARN("DLSS-NR Vulkan: Reuse bottleneck is {}", DlssNrNative::VitStatus());
         if (evaluated != 1)
@@ -2655,6 +2901,8 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     // Steady a full frame's answer and save this frame's history (DlssNr_DetailReuse_Vk.inl).
     DetailReuseVk::AfterModel(reuseFrame, reusePlan, evaluated == 1, answer);
 
+    // The model's history was reset this frame (the private DLSS starts over with it)
+    const bool superiorReset = g_vk.reset;
     g_vk.reset = false;
     g_vk.frames++;
 
@@ -2707,10 +2955,10 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
 
         if (!EdgeCompressionVk::pass->Dispatch(
                 cmdBuffer,
-                DlssNr::Spatial::MakeConstants(EdgeCompressionVk::Layout(), replaceCorrection ? 103 : 102, guides, 1.0f,
-                                               1.0f),
-                reads,
-                EdgeCompressionVk::proxy.view, EdgeCompressionVk::answer.view))
+                // As on D3D12: no edge-loss correction against the unstyled picture while an input style is on
+                DlssNr::Spatial::MakeConstants(EdgeCompressionVk::Layout(),
+                                               replaceCorrection && !inputRestyled ? 103 : 102, guides, 1.0f, 1.0f),
+                reads, EdgeCompressionVk::proxy.view, EdgeCompressionVk::answer.view))
         {
             EdgeCompressionVk::TurnOff(Spatial::Status::TurnedOffDispatch);
             g_vk.reset = true;
@@ -2749,6 +2997,7 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     // filter so the resolve composites a native answer against the native proxy 1:1 -- not the single
     // bilinear tap the Nx answer would otherwise get, which aliases the model's detail into noise. On
     // failure it falls back to the Nx pair (modelInput + output), the old behaviour.
+    bool superDownOk = false;
     OwnedImage* resolveProxy = ordinaryProxy;
     OwnedImage* resolveAnswer = ordinaryAnswer;
 
@@ -2759,7 +3008,8 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     // before the GPU dispatch executes).
     bool sgsrAnswerOk = false;
     const uint32_t upscaleMethod = cfg.DlssNrReducedUpscaleMethod.value_or_default();
-    const bool wantsSgsr1Answer = upscaleMethod == 1;
+    // Superior enlarges its own way (its resolve reads the model raster), as on D3D12
+    const bool wantsSgsr1Answer = upscaleMethod == 1 && !superiorRuns;
 
     // Gated on `reduced` (the actual rounded-size flag), not just workScale < 1.0f -- a workScale
     // that rounds back to the native size would otherwise engage SGSR1 at 1:1, wasted work with no
@@ -2804,7 +3054,7 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
             hasLoggedSgsrUp = true;
         }
     }
-    else if (reduced && workScale < 1.0f)
+    else if (reduced && workScale < 1.0f && !superiorRuns)
     {
         // Parity with the SGSR1 branch's own log above, change-gated the same way, so a log scan
         // can confirm the Bilinear choice actually took effect without needing a breakpoint.
@@ -2879,6 +3129,7 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     }
     else if (workScale > 1.0f && g_vk.superDown && g_vk.superDown->IsInit() && g_vk.outputNative.Valid())
     {
+        // (superDownOk: Superior needs the native pair; without it the ordinary resolve below takes the frame)
         Transition(cmdBuffer, *answer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         Transition(cmdBuffer, g_vk.outputNative, VK_IMAGE_LAYOUT_GENERAL);
 
@@ -2889,7 +3140,16 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         {
             resolveProxy = &g_vk.proxy;
             resolveAnswer = &g_vk.outputNative;
+            superDownOk = true;
         }
+    }
+
+    // Supersampling under SuperiorAtNative steadies the pair the down-leg averaged to native; without it the ordinary
+    // resolve takes the supersampled pair for this frame, as D3D12 does.
+    if (superiorRuns && superiorSupersample && !superDownOk)
+    {
+        SuperiorVk::GiveUp("its down-leg to native failed");
+        superiorRuns = false;
     }
 
     Transition(cmdBuffer, *resolveProxy, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -2898,9 +3158,48 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
 
     if (beforeSr)
         Transition(cmdBuffer, g_vk.preColor, VK_IMAGE_LAYOUT_GENERAL);
-    if (!g_vk.pass->Dispatch(cmdBuffer, resolve, width, height, resolveProxy->view, resolveAnswer->view, g_vk.keep.view,
-                             liveExposureView, beforeSr ? g_vk.preColor.view : colour->Resource.ImageViewInfo.ImageView,
-                             VK_NULL_HANDLE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    const VkImageView resolveTarget = beforeSr ? g_vk.preColor.view : colour->Resource.ImageViewInfo.ImageView;
+    // Superior's composition, on the model's own pair (no depth fade: its resolve leaves it out, as on D3D12).
+    SuperiorVk::Private::Frame superiorFrame;
+    if (superiorRuns)
+    {
+        superiorFrame.instance = instance;
+        superiorFrame.physicalDevice = physicalDevice;
+        superiorFrame.device = device;
+        superiorFrame.guides = &guides;
+        superiorFrame.mvX = superiorMvX;
+        superiorFrame.mvY = superiorMvY;
+        float frameMs = 0.f; // the game's own, as D3D12 reads it
+        if (params->Get(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, &frameMs) != NVSDK_NGX_Result_Success)
+            frameMs = 0.f;
+        superiorFrame.frameMs = frameMs;
+        superiorFrame.reset = superiorReset;
+        superiorFrame.depthInverted = depthInverted;
+        superiorFrame.haveDepth = SuperiorVk::depth.Valid() && superiorGuidesReady && SuperiorVk::depthIsReal;
+        superiorFrame.gameMotion = motion;
+        superiorFrame.gameMvX = gameMvX;
+        superiorFrame.gameMvY = gameMvY;
+        superiorFrame.reference = (createFlags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0
+                                      ? DlssNr::GuideExtent { renderWidth, renderHeight }
+                                      : DlssNr::GuideExtent { outputWidth, outputHeight };
+        superiorFrame.outputWidth = outputWidth;
+        superiorFrame.outputHeight = outputHeight;
+    }
+    bool resolved = false;
+    if (superiorRuns)
+    {
+        resolved = SuperiorVk::Compose(cmdBuffer, cfg, resolve, workScale, width, height, *resolveProxy, *resolveAnswer,
+                                       g_vk.keep, liveExposureView, resolveTarget, superiorFrame);
+        if (!resolved)
+        {
+            // The ordinary Matched residual resolve below takes this frame (the target is only written by a resolve).
+            SuperiorVk::GiveUp("its composition failed");
+            superiorRuns = false;
+        }
+    }
+    if (!resolved &&
+        !g_vk.pass->Dispatch(cmdBuffer, resolve, width, height, resolveProxy->view, resolveAnswer->view, g_vk.keep.view,
+                             liveExposureView, resolveTarget, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, fadeDepth))
     {
         Fail("the resolve dispatch failed");
@@ -2942,6 +3241,7 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
                 if (ms > 0.0 && ms < 1000.0)
                 {
                     g_vk.lastGpuTime = ms;
+                    g_vk.lastGpuTimeAtMs.store(SteadyMs(), std::memory_order_relaxed);
                     // Each frame's pair is read once, so full and reused frames both land here.
                     DetailReuseVk::RecordGpuTime(ms);
                 }
@@ -2995,6 +3295,7 @@ void ReleaseNrObjects()
     CalibrationVkShutdown(true);
     DetailReuseVk::Release(true);
     EdgeCompressionVk::Release(true);
+    SuperiorVk::Release(true);
     DepthFadeVk::Release(true);
 
     if (g_vk.feature != nullptr && g_vk.release != nullptr)
@@ -3090,6 +3391,8 @@ void ShutdownVk(bool deviceAlive)
         CalibrationVkShutdown(false);
         DetailReuseVk::Release(false);
         EdgeCompressionVk::Release(false);
+        SuperiorVk::Release(false);
+        SuperiorVk::Private::ShutdownOwnCore(false, VK_NULL_HANDLE);
         DepthFadeVk::Release(false);
         // The model's kernels went with the device without their destroy calls.
         DlssNrNative::VkDeviceLost();
@@ -3142,6 +3445,9 @@ void ShutdownVk(bool deviceAlive)
         g_vk.capabilityParams = nullptr;
         g_vk.paramsFromCore = false;
     }
+
+    // A core Superior started itself goes down with the device (nobody else will), after everything made under it.
+    SuperiorVk::Private::ShutdownOwnCore(true, g_vk.device);
 
     if (g_vk.queryPool != VK_NULL_HANDLE && g_vk.device != VK_NULL_HANDLE)
     {

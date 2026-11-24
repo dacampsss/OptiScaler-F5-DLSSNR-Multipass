@@ -718,10 +718,12 @@ inline const char* ActiveInputText(Decision decision, bool gameCallsReflex, bool
 // The reason when it does not run. Run has none here: the method in use names it. `gameReflexFeedsXell`: the game's own
 // Reflex calls are sent to XeFG's XeLL (native/XefgReflexRule.h), so its Reflex settings are not the thing to change;
 // `forceReflexDisabled`: fakenvapi's Force Disable, which XeLL then gets them with (low latency off).
-// `xefgSide`: with XeFG, what lowers latency (XefgLatency): Reflex or Anti-Lag 2 take the game's Reflex calls, XeLL only
-// keeps XeFG running (native/XefgReflexRule.h)
+// `xefgSide`: with XeFG, what lowers latency (XefgLatency): Reflex or Anti-Lag 2 take the game's Reflex calls, XeLL
+// only keeps XeFG running (native/XefgReflexRule.h). `gameReflexOff`: the game set its Reflex mode with low latency
+// off. In the Reflex split the driver gets that mode as it is (DriverSleepModeInSplit) and XeFG's XeLL follows it too
+// (XefgReflexRule.h GameTurnedLowLatencyOff), so nothing lowers latency then and the line must say so.
 inline const char* DecisionText(Decision decision, bool gameReflexFeedsXell = false, bool forceReflexDisabled = false,
-                                XefgLatency xefgSide = XefgLatency::XeLL)
+                                XefgLatency xefgSide = XefgLatency::XeLL, bool gameReflexOff = false)
 {
     switch (decision)
     {
@@ -734,7 +736,10 @@ inline const char* DecisionText(Decision decision, bool gameReflexFeedsXell = fa
         return "No Optical F5Low mode, XeFG or FSR frame generation is running";
     case Decision::GameRunsReflex:
         if (xefgSide == XefgLatency::Reflex)
-            return "The game's own Reflex lowers latency; XeLL only keeps XeFG running";
+        {
+            return gameReflexOff ? "Reflex is off in the game, so nothing lowers latency; XeLL only keeps XeFG running"
+                                 : "The game's own Reflex lowers latency; XeLL only keeps XeFG running";
+        }
 
         if (xefgSide == XefgLatency::AntiLag2)
             return "The game's Reflex calls go to Anti-Lag 2; XeLL only keeps XeFG running";
@@ -742,8 +747,11 @@ inline const char* DecisionText(Decision decision, bool gameReflexFeedsXell = fa
         if (!gameReflexFeedsXell)
             return "Use the game's own Reflex settings";
 
-        return forceReflexDisabled ? "The game's Reflex feeds XeFG's XeLL, low latency off by Force Disable"
-                                   : "The game's Reflex feeds XeFG's XeLL";
+        if (forceReflexDisabled)
+            return "The game's Reflex feeds XeFG's XeLL, low latency off by Force Disable";
+
+        return gameReflexOff ? "The game's Reflex feeds XeFG's XeLL; Reflex is off in the game, so low latency is off"
+                             : "The game's Reflex feeds XeFG's XeLL";
     case Decision::GameRunsXell:
         return "The game runs XeLL itself";
     case Decision::ForceReflexDisabled:
@@ -822,6 +830,7 @@ struct CapInputs
     bool xefgVsync = false;          // frame generation presents with V-Sync (State::fgPresentVsync)
     bool xellCountsShown = true;     // XeLL counts shown frames: the XeFG library tells it about its own (XeFGProxy)
     bool driverMultipliesCap = false; // DLSS-G behind XeFG's API: the driver multiplies the interval (XeFGProxy)
+    bool vkF5Low = false;             // F5Low on a native Vulkan swapchain: the driver never hears its multiplier
 };
 
 // Frames shown per frame the game renders: 1 + the generated ones, but only while frame generation generates. Stood
@@ -931,6 +940,10 @@ inline CapPlan PlanCap(const CapInputs& in)
     if (in.method == Method::XellWithXefg)
         return { CapOwner::LowLatency,
                  IntervalUs(in.xellCountsShown ? in.capFps : CapPerRenderedFrame(in.capFps, in.shownPerRendered)) };
+
+    // F5Low on Vulkan: the driver's interval counts the game's own frames, the shown cap is divided per rendered frame
+    if (in.vkF5Low)
+        return { CapOwner::LowLatency, IntervalUs(CapPerRenderedFrame(in.capFps, in.shownPerRendered)) };
 
     // Reflex, Anti-Lag 2 and LatencyFlex pace the game's own frames: FSR frame generation doubles them
     return { CapOwner::LowLatency, IntervalUs(in.fsrFgActive ? in.capFps / 2.0f : in.capFps) };

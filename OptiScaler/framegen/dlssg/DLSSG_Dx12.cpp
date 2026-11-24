@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include "DLSSG_Dx12.h"
+#include "DLSSG_Common.h"
 #include <hooks/SwapchainCreateRule.h>
 #include "Kcd2Hdr.h"
 
@@ -390,6 +391,10 @@ bool DLSSG_Dx12::Dispatch()
     if (dlssgSetOptionsResult != sl::Result::eOk)
     {
         LOG_ERROR("Couldn't set DLSSG options, error: {}", magic_enum::enum_name(dlssgSetOptionsResult));
+    }
+    else
+    {
+        DLSSG_Common::LogVramEstimate(viewport, options.numFramesToGenerate);
     }
 
     sl::ReflexOptions reflexConst = {};

@@ -26,7 +26,7 @@ void SuperiorReconstructedGuides(uint3 id, bool packed)
         motion = all(isfinite(v)) ? PwPack(nativePixel + v) - PwPack(nativePixel) : 0.0;
     }
     gTarget0[id.xy] = isfinite(depth) ? depth : (gUnused > 0.5 ? 0.0 : 1.0);
-    gTarget1[id.xy] = all(isfinite(motion)) ? motion : 0.0;
+    gTarget1[id.xy] = SuperiorMotionTexel(all(isfinite(motion)) ? motion : 0.0);
 }
 [numthreads(8, 8, 1)] void SuperiorSurfaceGuidesMain(uint3 id : SV_DispatchThreadID)
 {

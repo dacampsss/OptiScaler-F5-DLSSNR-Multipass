@@ -18,6 +18,8 @@
 #include "FrameContract.h"
 #include "SharedFrameVk.h"
 
+#include "../dlssnr/DlssNr_FinishedVkGuides.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -34,6 +36,16 @@ class VkFrameSource : public IFrameSource
     // waited on them, and the present must wait on PresentWait() instead once Return has run. Call before Acquire().
     void SetPresent(VkDevice device, VkPhysicalDevice physical, VkQueue queue, VkSwapchainKHR swapchain,
                     uint32_t imageIndex, const VkSemaphore* waits, uint32_t waitCount);
+
+    // Finished Picture on a Vulkan game that calls its own DLSS (dlssnr/DlssNr_FinishedVk.h): the capture this present
+    // uses, or null (nothing: the producer's own guides). Set before Acquire, every present. With one, Acquire copies
+    // the game's depth and motion into the shared guide images next to the picture and does not stand aside for the
+    // game's upscaler.
+    void SetGameGuides(const DlssNr::FinishedVk::Guides* guides);
+
+    // Frees the shared guide images once the game has stopped calling its DLSS for a while (`presentCount`: the Vulkan
+    // present count).
+    void TrimGuides(uint64_t presentCount);
 
     // After Return: the semaphore the present waits on in place of its own list, or VK_NULL_HANDLE when this frame was
     // not acquired (the present keeps its own list then).
@@ -98,12 +110,16 @@ class VkFrameSource : public IFrameSource
     static bool DeviceOfQueue(VkQueue queue, VkDevice* device, VkPhysicalDevice* physical);
     // The physical device a Vulkan device was made on; null when it was not seen.
     static VkPhysicalDevice PhysicalDeviceOf(VkDevice device);
+    // The distinct queue families of the device's queues (the capture ring's images are shared across them).
+    static std::vector<uint32_t> FamiliesOf(VkDevice device);
     // The usage a swapchain is made with: TRANSFER_SRC and TRANSFER_DST added when the surface allows them and NR is on.
     static VkImageUsageFlags SwapchainUsage(VkPhysicalDevice physical, const VkSwapchainCreateInfoKHR& info);
     // A swapchain was made: its images, format and colour space. The one it replaces is forgotten.
     static void NoteSwapchain(VkDevice device, VkSwapchainKHR swapchain, const VkSwapchainCreateInfoKHR& info);
     // The picture size of a swapchain seen at creation.
     static bool SwapchainExtent(VkSwapchainKHR swapchain, uint32_t* width, uint32_t* height);
+    // The format and colour space a swapchain was made with.
+    static bool SwapchainFormat(VkSwapchainKHR swapchain, VkFormat* format, VkColorSpaceKHR* space);
 
   private:
     static constexpr uint32_t kRing = 3;
@@ -123,6 +139,11 @@ class VkFrameSource : public IFrameSource
     void WaitRingIdle();
     void ReleaseDepth();
     void Release();
+
+    // The game's guides of this frame (SetGameGuides): the ring images into the shared guide images, in the copy-in
+    // command buffer. False (with _error) when they could not be shared.
+    bool RecordGuides(VkCommandBuffer copyIn, uint32_t family);
+    void ReleaseGuides();
 
     // The scene's depth for this frame (resource_tracking/GenericDepth_Vk.h): the finder's buffer into _depthShared in
     // the copy-in command buffer, then on D3D12 into _depthTexture. False when the frame has none.
@@ -163,6 +184,13 @@ class VkFrameSource : public IFrameSource
     SharedImageVk _picture;
     Slot _ring[kRing];
     uint32_t _ringFamily = UINT32_MAX;
+
+    // The game's guides (Finished Picture): this present's capture and the shared images it is copied into
+    bool _haveGuides = false;
+    DlssNr::FinishedVk::Guides _guides;
+    SharedImageVk _guideDepth;
+    SharedImageVk _guideMotion;
+    uint64_t _guidesUsedAt = 0; // the Vulkan present count of the last frame that took guides
 
     // The depth path. Its D3D12 copy has a fence of its own (not the shared one, whose values Vulkan also signals).
     SharedBufferVk _depthShared;

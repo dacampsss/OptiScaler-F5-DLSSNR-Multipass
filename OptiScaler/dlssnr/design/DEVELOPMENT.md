@@ -30,7 +30,9 @@ review for its change type below, against the specs here.**
 6. **Shader rebuild is real.** After editing `dlssnr.hlsl`, recompile BOTH targets (fxc
    `/T cs_5_0 /E CSMain /O3` DXBC → `DlssNr_Shader.h` array `DlssNr_cso`; dxc `-spirv -T cs_6_0 -E CSMain
    -O3 -Qstrip_debug -D VK_MODE -Cc -Vi` → `DlssNr_Shader_Vk.h` array `dlssnr_spv`; both headers with
-   `shader_tools/create_header.py`, run from `precompile/` so `#include "dlssnr_pq.hlsli"` resolves; with
+   `shader_tools/create_header.py`, plus the smooth canvas's tiled build of the same file (fxc `/T cs_5_0 /E CSMain /O3
+   /D DLSSNR_SMOOTH_CANVAS_TILED=1` -> `dlssnr_smooth_canvas_Shader.h` array `dlssnr_smooth_canvas_cso`; the WARP test
+   `tests/nr_input_style_shader_smoke.cpp` checks it against mode 16), run from `precompile/` so `#include "dlssnr_pq.hlsli"` resolves; with
    Git Bash set `MSYS_NO_PATHCONV=1` or fxc reads `/T` as a path) and confirm the `.cso`/`.spv` mtime is
    newer than the source and the built DLL is newer than the regenerated header. A stale header ships old
    shader logic silently. Check the recipe first: the committed source must rebuild byte-identically.

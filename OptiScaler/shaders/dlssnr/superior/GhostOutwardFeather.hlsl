@@ -18,7 +18,8 @@ Texture2D<float4> Answer : register(t4);
 #if DLSSNR_GHOST_FEATHER_STAGE == 0
 RWTexture2D<float2> Output : register(u0);
 #else
-RWTexture2D<float4> Output : register(u0);
+#include "VkFormat.hlsli"
+VK_FORMAT("rgba16f") RWTexture2D<float4> Output : register(u0);
 #endif
 #if DLSSNR_GHOST_FEATHER_STAGE == 1
 float3 RawEdit(int2 p)

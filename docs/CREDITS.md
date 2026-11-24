@@ -55,6 +55,17 @@ generation on Vulkan only with real FP8 (FakeMichau, the Vulkan half of `65ee5d6
 swapchain on another window out of frame generation (cdozdil, release/0.9 `192a59bb` and `0fc1ef63`, the other-window
 part only). The rules behind them, the per-chain wrapper handling and the host tests are this fork's own.
 
+## Custom providers and the plugin API (November 2026)
+
+Custom upscaler, frame generation and ray reconstruction providers (`custom\<name>\<kind>` folders for ffx, ffx_vk,
+ffx_fg, ffx_fg_vk, dlss, dlssg and dlssd), the plugin API with `plugin_sdk` (MIT) and provider registration by ASI
+plugins, regular upscalers in place of DLSSD, and the FidelityFX SDK 2.4 per-feature DLLs with the fallback to the older
+DLL are ported from [upstream OptiScaler](https://github.com/optiscaler/OptiScaler) (GPL-3.0) and adapted to this fork:
+FakeMichau (`de2626f1`, `63463bde`, `760ae412`, `941ce6a1`, `e6a4c3e8`, `db646bcb`, `df8a8f13`, `9e9a7190`, `74ae2c65`,
+`a0161cd9`, `6febb35b`), cdozdil (`c2a40331`, `6ce1b1a4`) and Michael Robles (@dashdogy; `9302028e`, `91ab9fe3`,
+`5f69a25d`). The provider lookup, the menu pages and cards, and the hooks onto this fork's NGX, FFX and Streamline layers
+are this fork's own.
+
 ## Inter font
 
 The menu's Modern style uses [Inter](https://github.com/rsms/inter) by Rasmus Andersson and the Inter Project
@@ -91,6 +102,14 @@ The edit cache (`EditCache` in the ini: the model one frame in N, its change to 
 ## Compress screen edges
 
 The layout and mapping behind Compress screen edges (the sharp middle, the squeezed edges, and the rational curve that packs and unpacks them) are adapted from [Yuri Grib / @BeliyG3's Optimizer FPS for DLSS5](https://github.com/BeliyG3/optimizer-fps-dlss5/tree/64902dd6a02460e5f6b778504ec2a4005faf4d9c) (MIT, Copyright (c) 2026 Yuri Grib), pinned at commit `64902dd6`. The way to apply it to NR (pack the colour, depth and motion, run the model on the packed picture, unpack the model's input and answer through the same resampling) follows [wilsjo2's fork](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass), v0.8.9 (OptiScaler-DLSSNR-PreSR-Multipass, commit [`be229250`](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/commit/be2292501f)), adapted onto this fork's own NR code. See the [licence](../Licenses/PeripheralWarp_LICENSE.txt).
+
+## XeSS in Unreal Engine games: scene depth and motion vectors
+
+Taking the scene depth and render resolution motion vectors from Intel's UE XeSS plugin (finding its velocity flattening by the texture name, the scene depth copy in queue order, the frame generation depth state) is ported from [upstream OptiScaler](https://github.com/optiscaler/OptiScaler) (GPL-3.0), by FakeMichau, commit `7e941561`. Adapted onto this fork: its own retire list for textures the GPU can still read (including the copy texture when it grows), one device only, an undone hook install on failure, `[XeSS] UnrealDepth` to turn it off, and the instruction decoding split out and host tested.
+
+## Status page
+
+The Status page (System, Detected, Hooks and Init Flags: what OptiScaler found and runs, dense enough for one screenshot) is ported from [upstream OptiScaler](https://github.com/optiscaler/OptiScaler)'s Status tab (GPL-3.0), by TheRazerMD and FakeMichau, commits `d63306ea`, `434b9555`, `76511542`, `2a382e1f`, `deb645a1`, `c220ad9e`, `76028322` and `fc44c2be`. It is drawn with this fork's menu cards, its words are in a host-tested rules header, and a card for this fork's own features (Neural Rendering, Optical F5Low, F5Low frame generation, HDR output, memory protection) is added.
 
 ## OptiScaler contributors
 

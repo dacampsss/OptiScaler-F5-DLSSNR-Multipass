@@ -5,6 +5,9 @@
 #include <hooks/Reflex_Hooks.h>
 #include <hooks/Streamline_Hooks.h>
 #include <native/NativeLowLatency.h>
+#include <misc/GpuMemory.h>
+
+#include <atomic>
 
 #include <magic_enum.hpp>
 
@@ -113,6 +116,8 @@ void DLSSG_Common::SetOptions(bool gameMarkersReachStreamline)
 
     if (dlssgSetOptionsResult != sl::Result::eOk)
         LOG_ERROR("Couldn't set DLSSG options, error: {}", magic_enum::enum_name(dlssgSetOptionsResult));
+    else
+        LogVramEstimate(_viewport, options.numFramesToGenerate);
 
     sl::ReflexOptions reflexConst = {};
     // Boost when Optical F5Low's low latency stands aside for us and the player asked for it (Boost)
@@ -124,6 +129,36 @@ void DLSSG_Common::SetOptions(bool gameMarkersReachStreamline)
 
     if (reflexSetOptionsResult != sl::Result::eOk)
         LOG_ERROR("Couldn't set Reflex options, error: {}", magic_enum::enum_name(reflexSetOptionsResult));
+}
+
+void DLSSG_Common::LogVramEstimate(const sl::ViewportHandle& viewport, unsigned int framesToGenerate)
+{
+    // Only for the log line (misc/GpuMemory.h): off with it. A few tries per count, SetOptions runs per frame.
+    static std::atomic<unsigned int> s_count { 0 };
+    static std::atomic<int> s_tries { 0 };
+
+    if (!GpuMemory::Active() || StreamlineProxy::DLSSGGetState() == nullptr)
+        return;
+
+    if (s_count.exchange(framesToGenerate) != framesToGenerate)
+        s_tries = 0;
+
+    if (s_tries.fetch_add(1) >= 8)
+        return;
+
+    sl::DLSSGState state {};
+    sl::DLSSGOptions options {};
+    options.mode = sl::DLSSGMode::eOn;
+    options.numFramesToGenerate = framesToGenerate;
+    options.flags = sl::DLSSGFlags::eRequestVRAMEstimate;
+
+    if (StreamlineProxy::DLSSGGetState()(viewport, state, &options) != sl::Result::eOk ||
+        state.estimatedVRAMUsageInBytes == 0)
+        return;
+
+    s_tries = 8; // got it
+    LOG_INFO("DLSS-G reports {} MB of GPU memory for {} generated frame(s) (slDLSSGGetState VRAM estimate)",
+             state.estimatedVRAMUsageInBytes / (1024 * 1024), framesToGenerate);
 }
 
 bool DLSSG_Common::SetConstants(int fIndex, uint32_t frameId, uint32_t mvWidth, uint32_t mvHeight)

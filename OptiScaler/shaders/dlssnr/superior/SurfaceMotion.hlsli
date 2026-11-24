@@ -1,3 +1,10 @@
+// The guide passes store motion in a texel of the format the backend declares: RG32F on D3D12, RGBA32F on Vulkan (an RG32
+// storage image is not offered everywhere; the model reads xy). Both builds write the same two values.
+#if defined(VK_MODE)
+#define SuperiorMotionTexel(m) float4((m), 0.0, 0.0)
+#else
+#define SuperiorMotionTexel(m) (m)
+#endif
 // A spatial, slope-limited reconstruction; no previous-frame resources or invented flow.
 float MotionMinmod(float a, float b) { return a > 0.0 && b > 0.0 ? min(a, b) : a < 0.0 && b < 0.0 ? max(a, b) : 0.0; }
 float2 MotionLimitedSlope(float2 a, float2 b)

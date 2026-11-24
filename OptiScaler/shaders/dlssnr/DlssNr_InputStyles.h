@@ -23,8 +23,9 @@ inline constexpr uint32_t kFlattenOff = 0;
 inline constexpr uint32_t kFlattenWatercolour = 1;
 inline constexpr uint32_t kFlattenSmoothCanvas = 2;
 
-// The most a style's strength does: watercolour and smooth canvas are a blend (1), the structure hint's boost goes to 3x
-inline float MostStrength(uint32_t style) { return style == kStyleStructureHint ? 3.0f : 1.0f; }
+// The most a style's strength does: watercolour is a blend (1); the structure hint's boost goes to 3x; the smooth
+// canvas blends up to 1 and above it runs again on its own result, up to 3 runs (Runs below)
+inline float MostStrength(uint32_t style) { return style == kStyleWatercolour ? 1.0f : 3.0f; }
 
 struct Styles
 {
@@ -65,6 +66,39 @@ inline int Passes(const Styles& s, Pass out[2])
         add(kStyleStructureHint, s.structureStrength);
 
     return n;
+}
+
+// The dispatches the passes make, in order (how many, 0..kMaxRuns). A smooth canvas above strength 1 is the same filter
+// again on its own result: whole runs at 1, then the rest as a blend (2.5 = 1, 1, 0.5; a rest under 0.005 is left
+// out). Repeating an edge-preserving filter flattens what is left of the texture while edges far outside its brightness
+// and colour tolerance still stay; widening that tolerance instead merged neighbouring regions. Everything else runs
+// once at its strength.
+inline constexpr int kMaxRuns = 4; // three smooth canvas runs and the structure hint
+
+inline int Runs(const Styles& s, Pass out[kMaxRuns])
+{
+    Pass passes[2];
+    const int n = Passes(s, passes);
+    int runs = 0;
+
+    for (int i = 0; i < n; ++i)
+    {
+        if (passes[i].style != kStyleSmoothCanvas || passes[i].strength <= 1.0f)
+        {
+            out[runs++] = passes[i];
+            continue;
+        }
+
+        float left = passes[i].strength;
+
+        while (left > 0.005f && runs < kMaxRuns)
+        {
+            out[runs++] = { kStyleSmoothCanvas, std::fmin(left, 1.0f) };
+            left -= 1.0f;
+        }
+    }
+
+    return runs;
 }
 
 inline bool Any(const Styles& s)

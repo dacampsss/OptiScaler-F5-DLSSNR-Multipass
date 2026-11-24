@@ -1225,6 +1225,74 @@ try
                "Coverage: a frame narrower than the grid measures a different set of pixels than the tiling covers");
     }
 
+    // Carried trust (every 3rd frame): two reused frames in a row on a still picture. The saved colour disagrees on
+    // x 4..11, so nothing is trusted there, and Fill reaches two pixels in: x 6..9 get no detail on the first reused
+    // frame. Saved as plain valid detail (as before), the second reused frame trusts that nothing in full and the hole
+    // stays; with carried trust it is distrusted there, and Fill closes the hole one step further.
+    {
+        gpu.newer = true;
+        const auto savedHole = Fill([](unsigned x, unsigned) {
+            return x >= 4 && x < 12 ? Px { 0.9f, 0.9f, 0.9f, 0.3f } : Px { 0.5f, 0.5f, 0.5f, 0.3f };
+        });
+        const auto flat = Fill([](unsigned, unsigned) { return Px { 0.1f, 0.1f, 0.1f, 1 }; }); // one detail everywhere
+        DlssNrDetailReuseConstants fill = Base(DlssNrDetailReuse_Fill);
+        fill.FillStrength = 1.0f;
+        fill.FillRadius = 2.0f;
+
+        const auto estimate1 = gpu.Run(Base(DlssNrDetailReuse_Estimate), { grey, flat, savedHole, still, depth });
+        fill.CarryTrust = 1;
+        Img carry1;
+        const auto answer1 = gpu.Run(fill, { grey, estimate1, grey, grey, depth }, &carry1);
+        expect(Near(carry1.at(1, 3).r, 1) && Near(carry1.at(4, 3).r, 1) && Near(carry1.at(7, 3).r, 0) &&
+                   Near(carry1.at(8, 3).r, 0),
+               "Carried trust: Fill says what is real (trusted or filled 1, neither 0)");
+        expect(Near3(answer1.at(4, 3), Grey(0.6f)) && Near3(answer1.at(7, 3), Grey(0.5f)),
+               "Carried trust: the first reused frame is filled two pixels in, and not deeper");
+
+        DlssNrDetailReuseConstants capture = Base(DlssNrDetailReuse_Capture);
+        Img colourDepth1;
+        const auto savedPlain = gpu.Run(capture, { grey, answer1, depth, carry1 }, &colourDepth1);
+        capture.CarryTrust = 1;
+        const auto savedCarried = gpu.Run(capture, { grey, answer1, depth, carry1 });
+        bool plainValid = true, carriedIsCarry = true;
+        for (unsigned y = 0; y < H; ++y)
+            for (unsigned x = 0; x < W; ++x)
+            {
+                plainValid = plainValid && Near(savedPlain.at(x, y).a, 1);
+                carriedIsCarry = carriedIsCarry && Near(savedCarried.at(x, y).a, carry1.at(x, y).r) &&
+                                 Near3(savedCarried.at(x, y), savedPlain.at(x, y));
+            }
+        expect(plainValid, "Carried trust: off, Capture saves every pixel as valid (as before)");
+        expect(carriedIsCarry, "Carried trust: Capture saves what is real as the detail's validity, same detail");
+
+        // The second reused frame: last frame's input was the grey, so colour and depth agree everywhere.
+        const auto plain2 =
+            gpu.Run(Base(DlssNrDetailReuse_Estimate), { grey, savedPlain, colourDepth1, still, depth });
+        const auto carried2 =
+            gpu.Run(Base(DlssNrDetailReuse_Estimate), { grey, savedCarried, colourDepth1, still, depth });
+        expect(Near(plain2.at(7, 3).a, 1) && Near3(plain2.at(7, 3), Grey(0.0f)),
+               "Carried trust: without it the hole is moved on as trusted detail (none)");
+        expect(Near(carried2.at(7, 3).a, 0) && Near(carried2.at(6, 3).a, 0),
+               "Carried trust: the hole is not trusted on the second reused frame");
+        expect(Near(carried2.at(1, 3).a, 1) && Near3(carried2.at(1, 3), Grey(0.1f)) && Near(carried2.at(4, 3).a, 1) &&
+                   Near3(carried2.at(4, 3), Grey(0.1f)),
+               "Carried trust: trusted and filled detail is moved on in full");
+        fill.CarryTrust = 0;
+        const auto answerPlain2 = gpu.Run(fill, { grey, plain2, grey, grey, depth });
+        const auto answerCarried2 = gpu.Run(fill, { grey, carried2, grey, grey, depth });
+        expect(Near3(answerPlain2.at(6, 3), Grey(0.5f)), "Carried trust: without it the hole stays as wide");
+        expect(Near3(answerCarried2.at(6, 3), Grey(0.6f)) && Near3(answerCarried2.at(9, 3), Grey(0.6f)),
+               "Carried trust: the second reused frame fills the hole a step further");
+
+        // Reproject (Fill off) says its trust the same way.
+        DlssNrDetailReuseConstants reproject = Base(DlssNrDetailReuse_Reproject);
+        reproject.CarryTrust = 1;
+        Img carryR;
+        gpu.Run(reproject, { grey, flat, savedHole, still, depth }, &carryR);
+        expect(Near(carryR.at(1, 3).r, 1) && Near(carryR.at(7, 3).r, 0), "Carried trust: Reproject says its trust");
+        gpu.newer = false;
+    }
+
     if (gpu.reference)
     {
         std::printf("Reference: %d runs outside the Replace modes compared, %d differ\n", gpu.identityRuns,

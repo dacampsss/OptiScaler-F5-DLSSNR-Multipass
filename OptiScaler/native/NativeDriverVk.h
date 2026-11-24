@@ -22,6 +22,9 @@ void OnPresent(VkQueue queue, VkPresentInfoKHR* present, VkDevice device, VkPhys
 // OnPresent put into it.
 void AfterPresent(VkSwapchainKHR swapchain);
 
+// Finished Picture ran on the last present (its capture was taken and the picture went through Neural Rendering)
+bool FinishedPictureRan();
+
 // The Vulkan present bridge (native/VkPresentBridge.h) makes its D3D12 swapchain on the frame source's private D3D12 device and
 // queue: made now and kept until ReleaseBridgeDevice.
 bool AcquireBridgeDevice(VkPhysicalDevice physical, ID3D12Device** device, ID3D12CommandQueue** queue, std::string& why);

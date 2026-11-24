@@ -388,6 +388,19 @@ int main()
         // Not running: not ours, whatever the cap
         cap.capFps = 60.0f;
         CHECK(PlanCap(cap).owner == CapOwner::NotOurs);
+
+        // F5Low on Vulkan: the shown cap is divided per rendered frame by our own low latency
+        {
+            CapInputs vk {};
+            vk.running = true;
+            vk.capFps = 120.0f;
+            vk.method = Method::RealReflex;
+            vk.shownPerRendered = 3;
+            vk.vkF5Low = true;
+            CHECK(PlanCap(vk).minimumIntervalUs == IntervalUs(40.0f));
+            vk.vkF5Low = false;
+            CHECK(PlanCap(vk).minimumIntervalUs == IntervalUs(120.0f));
+        }
         CHECK(PlanCap(cap).minimumIntervalUs == 0);
 
         // Running with no cap: ours, nothing to limit (the limiter has nothing to do either)
@@ -865,8 +878,9 @@ int main()
         xell = SleepModeForOutput(game, 8333, true, false);
         CHECK(xell.lowLatency && xell.minimumIntervalUs == 8333);
 
-        // The rule the D3D hooks share: XeFG is the output -> low latency on whatever the game says, the cap in place
-        // of the game's interval; only fakenvapi's Force Disable turns it off; no XeFG -> the game's mode as it is
+        // The rule the D3D hooks share: XeFG is the output -> low latency on for an input that never turned it off, the
+        // cap in place of the game's interval; fakenvapi's Force Disable or the game turning its own Reflex off (below)
+        // turn it off; no XeFG -> the game's mode as it is
         SleepMode gameOff;
         gameOff.minimumIntervalUs = 16667;
         auto out = SleepModeForOutput(gameOff, 0, true, false);
@@ -893,14 +907,40 @@ int main()
         CHECK(!XellHoldsCap(false, false, true, true)); // V-Sync: XeLL goes by the refresh rate
         CHECK(!XellHoldsCap(false, true, true, true));
 
-        // Reflex off in the game's menu: XeLL still runs (its sleeps carry the cap) and gets the cap
+        // An input that never turned low latency off (a game that only marks frames): XeLL runs and gets the cap
         SleepMode off;
         xell = SleepModeForOutput(off, 8333, true, false);
         CHECK(xell.lowLatency && xell.minimumIntervalUs == 8333);
 
+        // Reflex off in the game's menu: XeLL follows it (its sleeps are skipped, the limiter keeps the cap)
+        xell = SleepModeForOutput(off, 8333, true, false, false, true);
+        CHECK(!xell.lowLatency);
+        CHECK(GameTurnedLowLatencyOff(true, true, false, false));
+        CHECK(!GameTurnedLowLatencyOff(true, true, true, false));   // Reflex on in the game
+        CHECK(!GameTurnedLowLatencyOff(true, false, false, false)); // only marks frames: nothing was turned off
+        CHECK(!GameTurnedLowLatencyOff(false, true, false, false)); // OptiScaler's own calls, the UE mod's
+        CHECK(!GameTurnedLowLatencyOff(true, true, false, true));   // a frame generation that needs Reflex on
+        CHECK(!GameTurnedLowLatencyOff(true, true, false, false, true)); // Force Enable: XeLL's sleeps run
+
+        // ... and then XeLL does not keep the cap, the limiter does (one owner)
+        CHECK(XellSleepsOff(false, false, true, false));
+        CHECK(!XellHoldsCap(XellSleepsOff(false, false, true, false), false, true, false));
+        CHECK(XellHoldsCap(XellSleepsOff(false, false, false, false), false, true, false));
+
         // The menu: the game's Reflex stands us aside either way, and the text says where it goes
         CHECK(std::strcmp(DecisionText(Decision::GameRunsReflex), "Use the game's own Reflex settings") == 0);
         CHECK(std::strcmp(DecisionText(Decision::GameRunsReflex, true), "The game's Reflex feeds XeFG's XeLL") == 0);
+        // The Reflex split with Reflex off in the game: the line must not say Reflex lowers latency
+        CHECK(std::strstr(DecisionText(Decision::GameRunsReflex, false, false, XefgLatency::Reflex, true),
+                          "nothing lowers latency") != nullptr);
+        CHECK(std::strstr(DecisionText(Decision::GameRunsReflex, false, false, XefgLatency::Reflex, false),
+                          "Reflex lowers latency") != nullptr);
+        // XeLL follows the game's setting too: off in the game is said
+        CHECK(std::strstr(DecisionText(Decision::GameRunsReflex, true, false, XefgLatency::XeLL, true),
+                          "low latency is off") != nullptr);
+        // Force Disable keeps its own line
+        CHECK(std::strstr(DecisionText(Decision::GameRunsReflex, true, true, XefgLatency::XeLL, true),
+                          "Force Disable") != nullptr);
         CHECK(std::strcmp(DecisionText(Decision::GameRunsReflex, true, true),
                           "The game's Reflex feeds XeFG's XeLL, low latency off by Force Disable") == 0);
         CHECK(std::strcmp(DecisionText(Decision::GameRunsReflex, false, true), "Use the game's own Reflex settings") ==

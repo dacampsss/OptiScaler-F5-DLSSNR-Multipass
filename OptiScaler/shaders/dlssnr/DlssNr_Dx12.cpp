@@ -1,11 +1,13 @@
 #include "pch.h"
 #include <dlssnr/PassProfiles.h>
 #include <dlssnr/DlssNr_SuperiorScaling.h>
+#include <dlssnr/DlssNr_Weights.h>
 #include <dlssnr/DlssNr_SuperiorGains.h>
 #include <dlssnr/DlssNr_GpuLifetime.h>
 #include <dlssnr/DlssNr_AllocatorEpochs.h>
 #include <output/SdrToHdr_ProxyDx12.h>
 #include <native/DriverInitGate.h>
+#include <misc/IdentifyGpu.h>
 
 #include <set>
 #include <wrl/client.h>
@@ -77,6 +79,7 @@
 #include "DlssNr_FinishedRaster.h"
 #include "precompile/dlssnr_detail_stats_Shader.h"
 #include "precompile/dlssnr_detail_reuse_Shader.h"
+#include "precompile/dlssnr_smooth_canvas_Shader.h"
 #include "precompile/dlssnr_edit_cache_Shader.h"
 #include "precompile/dlssnr_spatial_Shader.h"
 #include "precompile/dlssnr_spatial_guides_Shader.h"
@@ -259,6 +262,11 @@ struct NrState
     int* lastCreate = nullptr;
     const char* (*lastModelError)() = nullptr;
     std::string modelError;
+    // Model weights selector (optional forwarder exports; an older forwarder lacks them and the DLL's own
+    // weights are used). builtWeightsSet = the set the current features were created with.
+    DlssNr::Weights::Exports weightsSelect;
+    int (*weightsTakeLog)(char*, int) = nullptr;
+    std::string builtWeightsSet;
 
     NVSDK_NGX_Parameter* capabilityParams = nullptr;
     // The loaded nvngx.dll_dlssnr.dll is the vendor-neutral port (it exports dlssnr_backend_id): it runs the
@@ -367,8 +375,10 @@ struct NrState
     Scaler nrScaler = Scaler::Count;
 
     // Experimental input styles (DlssNr_InputStyles.h): the model's picture restyled (DlssNrMode_Watercolor,
-    // DlssNrMode_StructureHint or DlssNrMode_SmoothCanvas), which then stands in for the model input and the resolve's proxy. Created when first
-    // used, parked with the scratch set; its state is tracked because the resolve reads it.
+    // DlssNrMode_StructureHint or DlssNrMode_SmoothCanvas), which then stands in for the model input and the resolve's
+    // proxy; above 100% Model resolution without Compress screen edges it is the styled native picture (nativeProxy),
+    // enlarged for the model and read by the resolve. Created when first used, parked with the scratch set; its state
+    // is tracked because the resolve reads it.
     ID3D12Resource* styled = nullptr;
     D3D12_RESOURCE_STATES styledState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     // The second texture the styles alternate with when more than one is on
@@ -641,6 +651,9 @@ std::unique_ptr<DlssNrGpuTime> g_scanTime;
 double g_scanTimeSum = 0.0, g_scanTimeMax = 0.0;
 unsigned g_scanTimeSamples = 0;
 std::optional<double> g_lastGpuTime;
+// When g_lastGpuTime was measured, in steady milliseconds (LastGpuTime shows a fresh one); atomic: the menu thread
+// reads it
+std::atomic<long long> g_lastGpuTimeAtMs { 0 };
 
 // Writes matched before/after frames on request, so comparisons stop depending on video.
 capture::FrameCapture g_capture;
@@ -778,7 +791,7 @@ bool EnsureForwarder()
     {
         LOG_ERROR("nvngx.dll_dlssnr.dll not found beside OptiScaler ({}) or the game executable",
                   g_dllDir.string());
-        g_nr.reason = "nvngx.dll_dlssnr.dll is missing";
+        g_nr.reason = "nvngx.dll_dlssnr.dll is missing. Copy it from the release zip next to OptiScaler.dll";
         return false;
     }
 
@@ -790,7 +803,8 @@ bool EnsureForwarder()
     {
         LOG_ERROR("nvngx.dll_dlssnr.dll found at {} but would not load, error {}", path.string(),
                   GetLastError());
-        g_nr.reason = "nvngx.dll_dlssnr.dll would not load";
+        g_nr.reason = "nvngx.dll_dlssnr.dll would not load. Copy it again from the release zip (details in "
+                      "OptiScaler.log)";
         return false;
     }
 
@@ -811,10 +825,12 @@ bool EnsureForwarder()
     g_nr.lastInit = (int*) GetProcAddress(g_nr.forwarder, "dlssnr_call_last_init");
     g_nr.lastCreate = (int*) GetProcAddress(g_nr.forwarder, "dlssnr_call_last_create");
     g_nr.lastModelError = (const char*(*)()) GetProcAddress(g_nr.forwarder, "dlssnr_call_error");
+    DlssNr::Weights::Load(g_nr.weightsSelect, g_nr.forwarder);
+    g_nr.weightsTakeLog = (int (*)(char*, int)) GetProcAddress(g_nr.forwarder, "dlssnr_weights_take_log");
 
     if (g_nr.create == nullptr || g_nr.evaluate == nullptr)
     {
-        g_nr.reason = "Update nvngx.dll_dlssnr.dll from the complete release (NR v2 exports required)";
+        g_nr.reason = "this nvngx.dll_dlssnr.dll is too old. Copy the one from the release zip";
         return false;
     }
 
@@ -833,23 +849,31 @@ bool EnsureCapabilityParams(ID3D12Device* device)
     if (g_nr.capabilityParams != nullptr)
         return true;
 
+    // Each failure logs which step failed; the reason (menu + log) says what the player can do.
     if (!NVNGXProxy::IsDx12Inited() && !NVNGXProxy::InitDx12(device))
     {
-        g_nr.reason = "the NGX core would not initialise";
+        LOG_ERROR("DLSS-NR: the NGX core would not initialise (InitDx12 failed; GPU DLSS-capable: {})",
+                  IdentifyGpu::getPrimaryGpu().dlssCapable);
+        g_nr.reason = IdentifyGpu::getPrimaryGpu().dlssCapable
+                          ? "NVIDIA's DLSS would not start. Update the NVIDIA driver (details in OptiScaler.log)"
+                          : "this GPU has no DLSS support. Neural Rendering needs an NVIDIA RTX card";
         return false;
     }
 
     if (NVNGXProxy::D3D12_GetCapabilityParameters() == nullptr)
     {
-        g_nr.reason = "the NGX core has no capability parameters";
+        LOG_ERROR("DLSS-NR: the NGX core has no capability parameters (D3D12_GetCapabilityParameters is null)");
+        g_nr.reason = "NVIDIA's DLSS would not start. Update the NVIDIA driver (details in OptiScaler.log)";
         return false;
     }
 
-    if (NVNGXProxy::D3D12_GetCapabilityParameters()(&g_nr.capabilityParams) != NVSDK_NGX_Result_Success ||
-        g_nr.capabilityParams == nullptr)
+    if (const NVSDK_NGX_Result capResult = NVNGXProxy::D3D12_GetCapabilityParameters()(&g_nr.capabilityParams);
+        capResult != NVSDK_NGX_Result_Success || g_nr.capabilityParams == nullptr)
     {
+        LOG_ERROR("DLSS-NR: the NGX core refused its capability parameters (result 0x{:X} {}, block {})",
+                  (uint32_t) capResult, NgxResultName((unsigned int) capResult), g_nr.capabilityParams != nullptr);
         g_nr.capabilityParams = nullptr;
-        g_nr.reason = "the NGX core refused its capability parameters";
+        g_nr.reason = "NVIDIA's DLSS would not start. Update the NVIDIA driver (details in OptiScaler.log)";
         return false;
     }
 
@@ -2221,9 +2245,25 @@ void SetExtras(const Config& cfg, ID3D12Resource* ui, ID3D12Resource* backbuffer
                    uiWidth, uiHeight, bbWidth, bbHeight);
 }
 
+// Hands the forwarder the weight set the next feature creates read (OptiScaler/nr_weights/<set>), or none.
+// SelectWeights is called before every create; DlssNr::Weights resolves and checks the folder.
+void SelectWeights(const Config& cfg)
+{
+    DlssNr::Weights::Select(g_nr.weightsSelect, cfg.DlssNrWeightsSetA.value_or_default(),
+                            cfg.DlssNrWeightsSetB.value_or_default(), "");
+}
+
+// The forwarder's account of what each weights read got (stock or which file), into OptiScaler.log.
+void LogWeightsReads() { DlssNr::Weights::LogReads(g_nr.weightsTakeLog, ""); }
 
 bool TuningMatchesFeature(const Config& cfg, unsigned int requestedPasses)
 {
+    // All passes on a model are built from that model's weight set (no forwarder: no rebuild for nothing)
+    if (g_nr.feature != nullptr && g_nr.weightsSelect.Available() &&
+        g_nr.builtWeightsSet != DlssNr::WeightsRules::BuiltKey(cfg.DlssNrWeightsSetA.value_or_default(),
+                                                               cfg.DlssNrWeightsSetB.value_or_default()))
+        return false;
+
     for (unsigned int pass = 0; pass < requestedPasses; ++pass)
     {
         // A profile cannot be stale until its feature exists. This lets a user prepare pass 2 or 3
@@ -2244,6 +2284,8 @@ void RecordBuiltPrimaryTuning(const Config& cfg)
 {
     g_nr.builtPassTuning[0] = PassTuning(cfg, 0);
     g_nr.builtPreset[0] = PassPreset(cfg, 0);
+    g_nr.builtWeightsSet = DlssNr::WeightsRules::BuiltKey(cfg.DlssNrWeightsSetA.value_or_default(),
+                                                          cfg.DlssNrWeightsSetB.value_or_default());
     g_nr.builtIntensity = cfg.DlssNrIntensity.value_or_default();
     g_nr.builtStyle[0] = PassStyle(cfg, 0);
     g_nr.builtLocalStructure = cfg.DlssNrLocalStructure.value_or_default();
@@ -2679,6 +2721,50 @@ void ParkIdleViews()
                  std::chrono::duration_cast<std::chrono::minutes>(kKeepIdle).count());
 }
 
+// Neural Rendering switched off: every view's models and surfaces go, as an idle view's do (parked, freed once the GPU
+// finished the lists that used them). Without this they stayed for the rest of the session: ~1.4 GB with 3 passes at
+// 1440p. Only after kOffRelease off, so a quick off/on to compare the look stays instant (building a pass again stops
+// the frame ~150-200 ms). Called on every evaluate while off; the retired list is ticked here too, as Dispatch no
+// longer runs.
+constexpr auto kOffRelease = std::chrono::seconds(10);
+std::chrono::steady_clock::time_point g_offSince {}; // zero while on
+
+// True once NR has been off for kOffRelease (the caller then also lets Deferred DLSS's own generation go).
+bool ReleaseWhileOff(ID3D12GraphicsCommandList* cmdList, unsigned long long epoch)
+{
+    TickNrRetired(epoch);
+
+    const auto now = std::chrono::steady_clock::now();
+    if (g_offSince == std::chrono::steady_clock::time_point {})
+        g_offSince = now;
+    if (now - g_offSince < kOffRelease)
+        return false;
+
+    bool holds = false;
+    for (int slot = -1; slot < (int) kAllSlots && !holds; ++slot)
+        holds = SlotHolds(slot);
+
+    if (holds)
+    {
+        // Before anything is parked: the items wait for this list (and the ones before it) to finish
+        WatchNrList(cmdList);
+
+        unsigned int parked = 0;
+        for (int slot = -1; slot < (int) kAllSlots; ++slot)
+        {
+            if (!SlotHolds(slot))
+                continue;
+            ParkSlot(slot);
+            ++parked;
+        }
+
+        LOG_INFO("DLSS-NR: switched off for {} s, {} view model(s) and their surfaces released",
+                 std::chrono::duration_cast<std::chrono::seconds>(kOffRelease).count(), parked);
+    }
+
+    return true;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -2800,10 +2886,12 @@ bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssN
     // shader spends a whole 8x8 thread group on each tile, so it dispatches one group per tile.
     const bool parallelExposureMeter =
         InConstants.Mode == DlssNrMode_Meter && InConstants.MeterCopiesExposure == 0;
-    const UINT dispatchWidth =
-        parallelExposureMeter ? InConstants.Width : (InConstants.Width + _numThreadsX - 1) / _numThreadsX;
-    const UINT dispatchHeight =
-        parallelExposureMeter ? InConstants.Height : (InConstants.Height + _numThreadsY - 1) / _numThreadsY;
+    // The tiled smooth canvas runs 16x16 groups.
+    const bool tiledCanvas = overridePipeline != nullptr && overridePipeline == _smoothCanvasPipelineState;
+    const UINT groupX = tiledCanvas ? 16u : _numThreadsX;
+    const UINT groupY = tiledCanvas ? 16u : _numThreadsY;
+    const UINT dispatchWidth = parallelExposureMeter ? InConstants.Width : (InConstants.Width + groupX - 1) / groupX;
+    const UINT dispatchHeight = parallelExposureMeter ? InConstants.Height : (InConstants.Height + groupY - 1) / groupY;
     if (GpuMarkers::On())
         GpuMarkers::Mark(
             InCmdList,
@@ -2847,6 +2935,8 @@ DlssNr_Dx12::~DlssNr_Dx12()
         _exposureAdaptPipelineState->Release();
     if (_detailReusePipelineState)
         _detailReusePipelineState->Release();
+    if (_smoothCanvasPipelineState)
+        _smoothCanvasPipelineState->Release();
     if (_editCachePipelineState)
         _editCachePipelineState->Release();
     if (_spatialPipelineState)
@@ -3295,6 +3385,23 @@ bool DlssNr_Dx12::DispatchExposureAdapt(ID3D12GraphicsCommandList* InCmdList, co
     InCmdList->Dispatch(1, 1, 1);
 
     return true;
+}
+
+ID3D12PipelineState* DlssNr_Dx12::SmoothCanvasPipeline()
+{
+    if (!_smoothCanvasPipelineState && !_smoothCanvasPipelineFailed && _init)
+    {
+        CreateComputePipeline(_device, &_smoothCanvasPipelineState, dlssnr_smooth_canvas_cso,
+                              sizeof(dlssnr_smooth_canvas_cso), nullptr);
+
+        if (_smoothCanvasPipelineState == nullptr)
+        {
+            _smoothCanvasPipelineFailed = true;
+            LOG_WARN("DLSS-NR: the tiled smooth canvas could not be built; the style runs in the main shader (slower)");
+        }
+    }
+
+    return _init ? _smoothCanvasPipelineState : nullptr;
 }
 
 bool DlssNr_Dx12::DetailReuseReady()
@@ -4031,6 +4138,14 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         spatial = false;
         superiorPacked = false;
     }
+    // [DlssNr] SuperiorAtNative: the private DLSS at 100% and above. Above 100% it works at native, on the pair after
+    // the supersample down-leg, while NR itself keeps its supersampled raster and its ordinary guides.
+    const bool superiorAtNative =
+        superior && DlssNr::SuperiorScaling::StabilizeAtNative(
+                        cfg.DlssNrSuperiorAtNative.value_or_default(), workScale, spatial,
+                        cfg.DlssNrSuperiorScalingPreset.value_or_default(), superiorState.srUnavailable);
+    const bool superiorSupersample =
+        DlssNr::SuperiorScaling::StabilizeSupersampled(superiorAtNative, width, height, workWidth, workHeight);
 
     if (!spatial)
         EdgeCompression::Release();
@@ -4177,8 +4292,11 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         g_nr.activeColor = CreateScratch(device, desc.Format, width, height);
     if (cropColor && g_nr.activeColor == nullptr)
     {
+        LOG_ERROR("DLSS-NR: the pre-SR active colour staging texture could not be allocated ({}x{}, format {})", width,
+                  height, (uint32_t) desc.Format);
         g_nr.failed = true;
-        g_nr.reason = "the pre-SR active colour staging texture could not be allocated";
+        g_nr.reason = "a texture for NR before SR could not be made (often low video memory). Lower the model "
+                      "resolution or texture quality, then Retry";
         LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
         device->Release();
         return;
@@ -4334,7 +4452,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         if (!snippet.has_value())
         {
             g_nr.failed = true;
-            g_nr.reason = "nvngx_dlssnr.dll was not found beside OptiScaler or the game";
+            g_nr.reason = "nvngx_dlssnr.dll was not found beside OptiScaler or the game. Copy it from the release zip";
             LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
             device->Release();
             return;
@@ -4353,6 +4471,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         }
 
         SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
+        SelectWeights(cfg);
         const auto tuning = PassTuning(cfg, 0);
         // Not at the same moment as a game's vkCreateDevice (native/DriverInitGate.h)
         native::DriverInitScope driverInit;
@@ -4366,12 +4485,14 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                         // UI correction at the model's own default: with no UI layer fed to it there
                         // is nothing for it to correct.
                         1);
+        LogWeightsReads();
 
         if (g_nr.feature == nullptr)
         {
             g_nr.featurePendingSubmission = false;
             g_nr.failed = true;
-            g_nr.reason = "the model would not initialise";
+            g_nr.reason = "the model would not start. Lower the model resolution or passes, or update the GPU "
+                          "driver (details in OptiScaler.log)";
             if (g_nr.lastModelError && *g_nr.lastModelError())
             {
                 g_nr.modelError = g_nr.lastModelError();
@@ -4496,6 +4617,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             else
             {
                 SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
+                SelectWeights(cfg);
                 const auto tuning = PassTuning(cfg, pass);
                 native::DriverInitScope driverInit;
                 g_nr.passFeature[pass] = g_nr.create(
@@ -4505,6 +4627,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                     (int) PassStyle(cfg, pass),
                     tuning.structure, tuning.tone, tuning.skin,
                     tuning.autoMask ? 1 : 0, 1);
+                LogWeightsReads();
 
                 if (g_nr.passFeature[pass] != nullptr)
                 {
@@ -4536,11 +4659,13 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (superior)
     {
         ResTrack_Dx12::HookLateNrQueue(device);
-        const bool temporal = DlssNr::SuperiorScaling::NeedsTemporal(width, height, workWidth, workHeight, spatial,
-                                                                     modelWidth, modelHeight);
-        if (SuperiorRun::Begin(*this, cmdList, device, colourFormat, width, height,
-                               superiorPacked ? modelWidth : workWidth, superiorPacked ? modelHeight : workHeight,
-                               workScale, frame, temporal, depth && guides.depth.valid(),
+        const bool temporal =
+            superiorAtNative || DlssNr::SuperiorScaling::NeedsTemporal(width, height, workWidth, workHeight, spatial,
+                                                                       modelWidth, modelHeight);
+        const unsigned superiorW = superiorPacked ? modelWidth : superiorSupersample ? width : workWidth;
+        const unsigned superiorH = superiorPacked ? modelHeight : superiorSupersample ? height : workHeight;
+        if (SuperiorRun::Begin(*this, cmdList, device, colourFormat, width, height, superiorW, superiorH, workScale,
+                               frame, temporal, depth && guides.depth.valid(),
                                superiorPacked ? &EdgeCompression::Layout() : nullptr) != SuperiorRun::Began::Run)
         {
             device->Release();
@@ -4588,8 +4713,9 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     if (!haveCodec)
     {
+        LOG_ERROR("DLSS-NR: the colour codec would not compile");
         g_nr.failed = true;
-        g_nr.reason = "the colour codec would not compile";
+        g_nr.reason = "a shader would not compile. Please report it with OptiScaler.log";
         LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
         device->Release();
         return;
@@ -5278,8 +5404,163 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     // Below full resolution the model is shown a filtered shrink of the proxy; the edit it returns is
     // enlarged during the resolve while the frame underneath stays full size and untouched.
+    // Experimental input styles (Config.h DlssNrInputFlatten ..., DlssNr_InputStyles.h): restyle the model's picture,
+    // each style that is on in turn (flatten, then structure hint), each on the one before's result, alternating
+    // between two textures. The result stands in for the model input AND for the picture the resolve compares the
+    // model's answer with, so Composed hands back only what the model painted on top of it. Where that comparison
+    // picture comes from decides where the styling runs:
+    //  - up to 100% model resolution, and above it with Compress screen edges (the resolve's proxy is unpacked from the
+    //    model input itself): on the final model input, after the shrink and the edge packing;
+    //  - above 100% without Compress screen edges (the model sees an enlarged copy, the resolve compares at native size
+    //    against colorCopy): on the native picture BEFORE it is enlarged, and the resolve compares against that styled
+    //    native picture (nativeProxy), so both sides agree as they do below 100%.
+    // Skipped on the deferred path.
+    bool inputRestyled = false;
+    const DlssNrInput::Styles inputStyles = cfg.DlssNrInputStyles();
+    DlssNrInput::Pass inputPasses[DlssNrInput::kMaxRuns];
+    const int inputPassCount = DlssNrInput::Runs(inputStyles, inputPasses);
+    const bool styleNative = inputPassCount > 0 && workScale > 1.0f && !spatial;
+    ID3D12Resource* nativeProxy = g_nr.colorCopy;
+
+    auto restyle = [&](ID3D12Resource* input) -> ID3D12Resource*
+    {
+        const DlssNrInput::Styles& styles = inputStyles;
+        const DlssNrInput::Pass* passes = inputPasses;
+        const int passCount = inputPassCount;
+        ID3D12Resource* result = input;
+
+        const char* skip = passCount == 0                              ? nullptr
+                           : cfg.DlssNrDeferredDlss.value_or_default() ? "the deferred Super Resolution path"
+                                                                       : nullptr;
+        int ran = 0;
+
+        if (passCount > 0 && skip == nullptr)
+        {
+            const D3D12_RESOURCE_DESC in = input->GetDesc();
+
+            // One texture for one style, two to alternate between for more (the second is let go while one is enough)
+            ID3D12Resource** targets[2] = { &g_nr.styled, &g_nr.styledB };
+            D3D12_RESOURCE_STATES* targetStates[2] = { &g_nr.styledState, &g_nr.styledBState };
+
+            if (passCount < 2 && g_nr.styledB != nullptr)
+            {
+                ParkNrResource(g_nr.styledB);
+                g_nr.styledBState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            }
+
+            for (int t = 0; t < (passCount > 1 ? 2 : 1); ++t)
+            {
+                ID3D12Resource*& target = *targets[t];
+
+                if (target != nullptr &&
+                    (target->GetDesc().Width != in.Width || target->GetDesc().Height != in.Height ||
+                     target->GetDesc().Format != in.Format))
+                {
+                    ParkNrResource(target);
+                    *targetStates[t] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                }
+
+                if (target == nullptr)
+                {
+                    target = CreateScratch(device, in.Format, (unsigned int) in.Width, in.Height);
+                    *targetStates[t] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                }
+            }
+
+            ID3D12Resource* source = input;
+
+            for (int k = 0; k < passCount; ++k)
+            {
+                const uint32_t style = passes[k].style;
+                ID3D12Resource* target = *targets[k % 2];
+                D3D12_RESOURCE_STATES& targetState = *targetStates[k % 2];
+
+                if (target == nullptr)
+                {
+                    skip = "its texture could not be created";
+                    break;
+                }
+
+                Barrier(cmdList, target, targetState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                DlssNrConstants paint {};
+                paint.Mode = StyleMode(style);
+                paint.Width = (unsigned int) in.Width;
+                paint.Height = in.Height;
+                paint.Passthrough = isHdrBuffer ? 0u : 1u;
+                paint.ReversibleMode = cfg.DlssNrReversibleMode.value_or_default();
+                paint.TransferStrength = passes[k].strength;
+                paint.SkinProtection = styles.facesOnly ? 1u : 0u; // the style passes read it as "faces only"
+
+                // The smooth canvas in its tiled build where there is one (the same picture, about 3x faster)
+                ID3D12PipelineState* pipeline =
+                    style == DlssNrInput::kStyleSmoothCanvas ? SmoothCanvasPipeline() : nullptr;
+                const bool painted = DispatchPass(cmdList, paint, source, nullptr, nullptr, nullptr, nullptr, target,
+                                                  nullptr, nullptr, pipeline);
+
+                Barrier(cmdList, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                targetState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+                // A failed dispatch left its texture as it was: the model gets the picture up to the last style that
+                // ran
+                if (!painted)
+                {
+                    skip = "its dispatch failed";
+                    break;
+                }
+
+                source = target;
+                ++ran;
+            }
+
+            if (ran > 0)
+            {
+                result = source;
+                inputRestyled = true;
+            }
+        }
+
+        // Said when it changes, so a log shows each A/B toggle.
+        static std::string said = "-";
+        std::string state;
+
+        for (int k = 0; k < ran; ++k)
+            state += std::format("{}{} {:.2f}", k == 0 ? "" : ", ", StyleName(passes[k].style), passes[k].strength);
+
+        if (skip != nullptr)
+            state += std::format("{}skipped ({})", ran > 0 ? "; then " : "", skip);
+
+        // Where it ran is part of the state, so moving Model resolution across 100% logs a line too
+        if (ran > 0)
+            state += styleNative ? " (native picture before the enlarge)" : spatial ? " (edge-compressed picture)" : "";
+
+        if (state != said)
+        {
+            said = state;
+
+            if (ran > 0)
+                LOG_INFO("DLSS-NR input style: {} ({}x{}{})", state, result->GetDesc().Width, result->GetDesc().Height,
+                         styles.facesOnly ? ", faces only" : "");
+            else if (skip != nullptr)
+                LOG_INFO("DLSS-NR input style: {}", state);
+            else
+                LOG_INFO("DLSS-NR input style: off");
+        }
+
+        return result;
+    };
+
     bool superiorInputReady = true;
     ID3D12Resource* modelInput = g_nr.colorCopy;
+
+    // Above 100% without Compress screen edges: style the native picture, which is then enlarged for the model and is
+    // what the resolve compares the model's (shrunk) answer with.
+    if (styleNative)
+    {
+        nativeProxy = restyle(g_nr.colorCopy);
+        modelInput = nativeProxy;
+    }
 
     if (reduced && (!spatial || replaceCorrection) && g_nr.colorSmall != nullptr)
     {
@@ -5307,8 +5588,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             if (g_nr.superDown == nullptr)
                 g_nr.superDown = new OS_Dx12("DLSS-NR supersample down", device, false, nrScaler);
 
-            if (g_nr.superUp != nullptr &&
-                g_nr.superUp->Dispatch(cmdList, g_nr.colorCopy, g_nr.colorSmall))
+            if (g_nr.superUp != nullptr && g_nr.superUp->Dispatch(cmdList, modelInput, g_nr.colorSmall))
             {
                 Barrier(cmdList, g_nr.colorSmall, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -5480,129 +5760,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         modelMotion = EdgeCompression::motion;
     }
 
-    // Experimental input styles (Config.h DlssNrInputFlatten ..., DlssNr_InputStyles.h): restyle the model's picture once
-    // it is final (after the shrink and the edge packing), each style that is on in turn (flatten, then structure hint),
-    // each on the one before's result, alternating between two textures. The last result is both the
-    // model input and the resolve's proxy (ordinaryProxy below, and through the edge unpacking), so Composed hands back
-    // only what the model painted on top of it. Skipped above 100% model resolution (the resolve compares against
-    // colorCopy there) and on the deferred path.
-    bool inputRestyled = false;
-    {
-        const DlssNrInput::Styles styles = cfg.DlssNrInputStyles();
-        DlssNrInput::Pass passes[2];
-        const int passCount = DlssNrInput::Passes(styles, passes);
-
-        const char* skip = passCount == 0                              ? nullptr
-                           : cfg.DlssNrDeferredDlss.value_or_default() ? "the deferred Super Resolution path"
-                           : workScale > 1.0f                          ? "model resolution above 100%"
-                                                                       : nullptr;
-        int ran = 0;
-
-        if (passCount > 0 && skip == nullptr)
-        {
-            const D3D12_RESOURCE_DESC in = modelInput->GetDesc();
-
-            // One texture for one style, two to alternate between for more (the second is let go while one is enough)
-            ID3D12Resource** targets[2] = { &g_nr.styled, &g_nr.styledB };
-            D3D12_RESOURCE_STATES* targetStates[2] = { &g_nr.styledState, &g_nr.styledBState };
-
-            if (passCount < 2 && g_nr.styledB != nullptr)
-            {
-                ParkNrResource(g_nr.styledB);
-                g_nr.styledBState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            }
-
-            for (int t = 0; t < (passCount > 1 ? 2 : 1); ++t)
-            {
-                ID3D12Resource*& target = *targets[t];
-
-                if (target != nullptr && (target->GetDesc().Width != in.Width || target->GetDesc().Height != in.Height ||
-                                          target->GetDesc().Format != in.Format))
-                {
-                    ParkNrResource(target);
-                    *targetStates[t] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-                }
-
-                if (target == nullptr)
-                {
-                    target = CreateScratch(device, in.Format, (unsigned int) in.Width, in.Height);
-                    *targetStates[t] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-                }
-            }
-
-            ID3D12Resource* source = modelInput;
-
-            for (int k = 0; k < passCount; ++k)
-            {
-                const uint32_t style = passes[k].style;
-                ID3D12Resource* target = *targets[k % 2];
-                D3D12_RESOURCE_STATES& targetState = *targetStates[k % 2];
-
-                if (target == nullptr)
-                {
-                    skip = "its texture could not be created";
-                    break;
-                }
-
-                Barrier(cmdList, target, targetState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-                DlssNrConstants paint {};
-                paint.Mode = StyleMode(style);
-                paint.Width = (unsigned int) in.Width;
-                paint.Height = in.Height;
-                paint.Passthrough = isHdrBuffer ? 0u : 1u;
-                paint.ReversibleMode = cfg.DlssNrReversibleMode.value_or_default();
-                paint.TransferStrength = passes[k].strength;
-                paint.SkinProtection = styles.facesOnly ? 1u : 0u; // the style passes read it as "faces only"
-
-                const bool painted = DispatchPass(cmdList, paint, source, nullptr, nullptr, nullptr, nullptr, target, nullptr);
-
-                Barrier(cmdList, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                targetState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-
-                // A failed dispatch left its texture as it was: the model gets the picture up to the last style that ran
-                if (!painted)
-                {
-                    skip = "its dispatch failed";
-                    break;
-                }
-
-                source = target;
-                ++ran;
-            }
-
-            if (ran > 0)
-            {
-                modelInput = source;
-                inputRestyled = true;
-            }
-        }
-
-        // Said when it changes, so a log shows each A/B toggle.
-        static std::string said = "-";
-        std::string state;
-
-        for (int k = 0; k < ran; ++k)
-            state += std::format("{}{} {:.2f}", k == 0 ? "" : ", ", StyleName(passes[k].style), passes[k].strength);
-
-        if (skip != nullptr)
-            state += std::format("{}skipped ({})", ran > 0 ? "; then " : "", skip);
-
-        if (state != said)
-        {
-            said = state;
-
-            if (ran > 0)
-                LOG_INFO("DLSS-NR input style: {} ({}x{}{}{})", state, modelInput->GetDesc().Width,
-                         modelInput->GetDesc().Height, styles.facesOnly ? ", faces only" : "",
-                         spatial ? ", edge-compressed picture" : "");
-            else if (skip != nullptr)
-                LOG_INFO("DLSS-NR input style: {}", state);
-            else
-                LOG_INFO("DLSS-NR input style: off");
-        }
-    }
+    if (!styleNative)
+        modelInput = restyle(modelInput);
 
     // The vectors were scaled to full-frame pixels; the image the model reprojects is the working size.
     // The vectors were scaled to full-frame pixels; the image the model reprojects is the
@@ -5631,7 +5790,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         if (proxyResult != 1)
         {
             g_nr.failed = true;
-            g_nr.reason = "the proxy path could not run the model";
+            g_nr.reason = "the model could not run. Please report it with OptiScaler.log";
             LOG_ERROR("DLSS-NR (proxy): evaluate returned 0x{:X} ({}), disabling for this session",
                       proxyResult, NgxResultName(proxyResult));
         }
@@ -5920,7 +6079,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                                      spatial ? guides : matchedRegions, frame);
         if (!ok)
             result = NVSDK_NGX_Result_Fail;
-        else if (!spatial)
+        // Supersampling under SuperiorAtNative: the matched guides are the private DLSS's native ones, not the model's
+        else if (!spatial && !superiorSupersample)
         {
             superiorMatched = true;
             modelDepth = superiorGeneration->depth.Get();
@@ -6000,14 +6160,14 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         MakeModelReadable(finalAnswer);
         superiorCompleted = pass + 1u;
         // Frequency shaping between passes needs no private DLSS: No DLSS shapes like CNN and Transformer do.
-        if (superiorGeneration && (superiorGeneration->shaping || (spatial && superiorGainScales.low < 1.0f)) &&
-            pass + 1u < effectivePasses)
+        // (Not while supersampling under SuperiorAtNative: its generation works at native, the passes above it.)
+        if (superiorGeneration && !superiorSupersample &&
+            (superiorGeneration->shaping || (spatial && superiorGainScales.low < 1.0f)) && pass + 1u < effectivePasses)
         {
             const bool due = superiorSchedule.Due(pass, superiorCovered);
-            const bool ran =
-                due &&
-                SuperiorRun::InterPass(*superiorGeneration, *this, cmdList, cfg, spatial ? modelInput : g_nr.colorCopy,
-                                       modelInput, finalAnswer, superiorCovered, superiorCompleted, superiorGainScales);
+            const bool ran = due && SuperiorRun::InterPass(*superiorGeneration, *this, cmdList, cfg,
+                                                           spatial ? modelInput : nativeProxy, modelInput, finalAnswer,
+                                                           superiorCovered, superiorCompleted, superiorGainScales);
             if (ran)
             {
                 superiorCovered = superiorCompleted;
@@ -6175,13 +6335,15 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (spatial && (!superiorPacked || CalibrationActive()) && result == NVSDK_NGX_Result_Success &&
         finalAnswer != nullptr)
     {
-        spatialUnpacked =
-            EdgeCompression::PrepareUnpack(device, EdgeCompression::Layout()) &&
-            DispatchSpatial(cmdList,
-                            DlssNr::Spatial::MakeConstants(EdgeCompression::Layout(), replaceCorrection ? 103 : 102,
-                                                           guides, 1.0f, 1.0f),
-                            modelInput, finalAnswer, replaceCorrection ? spatialReference : nullptr,
-                            EdgeCompression::proxy, EdgeCompression::answer);
+        // Replace's edge-loss correction measures against the unstyled picture; while an input style is on it would put
+        // the game's texture back in the compressed edge bands only, so it is left out (Replace shows the painting).
+        const bool correctEdges = replaceCorrection && !inputRestyled;
+        spatialUnpacked = EdgeCompression::PrepareUnpack(device, EdgeCompression::Layout()) &&
+                          DispatchSpatial(cmdList,
+                                          DlssNr::Spatial::MakeConstants(EdgeCompression::Layout(),
+                                                                         correctEdges ? 103 : 102, guides, 1.0f, 1.0f),
+                                          modelInput, finalAnswer, correctEdges ? spatialReference : nullptr,
+                                          EdgeCompression::proxy, EdgeCompression::answer);
 
         if (spatialUnpacked)
         {
@@ -6503,8 +6665,9 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             }
         }
 
-        ID3D12Resource* resolveProxy = pairDownOk ? EdgeCompression::proxyNative
-                                       : superDownOk ? g_nr.colorCopy : ordinaryProxy;
+        ID3D12Resource* resolveProxy = pairDownOk    ? EdgeCompression::proxyNative
+                                       : superDownOk ? nativeProxy
+                                                     : ordinaryProxy;
         ID3D12Resource* resolveAnswer = pairDownOk ? EdgeCompression::answerNative
                                         : (superDownOk || sgsrAnswerOk) ? g_nr.outputNative : ordinaryAnswer;
 
@@ -6528,11 +6691,15 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         // the output takes a UAV, so resolveTarget is the output there)
         if (cached)
             EditCache::ApplyCached(cacheFrame, resolveTarget);
-        else if (superiorGeneration && (superiorGeneration->shaping || (spatial && superiorGainScales.low < 1.0f)))
+        // Supersampling under SuperiorAtNative steadies the pair the down-leg averaged to native; without it (down-leg
+        // failed) the ordinary resolve below takes the supersampled pair, as with Superior off.
+        else if (superiorGeneration && (!superiorSupersample || superDownOk) &&
+                 (superiorGeneration->shaping || (spatial && superiorGainScales.low < 1.0f)))
         {
             auto& g = *superiorGeneration;
-            auto* shapingProxy = g.packed ? modelInput : g.shaping ? ordinaryProxy : resolveProxy;
-            auto* answer = g.packed ? finalAnswer : g.shaping ? ordinaryAnswer : resolveAnswer;
+            const bool modelPair = g.shaping && !superiorSupersample;
+            auto* shapingProxy = g.packed ? modelInput : modelPair ? ordinaryProxy : resolveProxy;
+            auto* answer = g.packed ? finalAnswer : modelPair ? ordinaryAnswer : resolveAnswer;
             auto* residual = g.PrivateReady() && depth && guides.depth.valid()
                                  ? SuperiorRun::Stabilize(g, *this, cmdList, shapingProxy, answer, motionIn, guides,
                                                           frame, superiorReset, g_nr.heldActive,
@@ -6687,7 +6854,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     else
     {
         g_nr.failed = true;
-        g_nr.reason = "the model refused to run";
+        g_nr.reason = "the model refused to run. Lower the model resolution or passes, then Retry (details in "
+                      "OptiScaler.log)";
         if (g_nr.lastModelError && *g_nr.lastModelError())
         {
             g_nr.modelError = g_nr.lastModelError();
@@ -6827,7 +6995,13 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         if (queue != nullptr)
         {
             if (auto ms = g_gpuTime->ReadGpuTime(queue); ms.has_value())
+            {
                 g_lastGpuTime = ms;
+                g_lastGpuTimeAtMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count(),
+                                        std::memory_order_relaxed);
+            }
             // Every completed frame, not only the newest: full and reused frames alternate, and two can complete
             // between reads.
             for (const double sample : g_gpuTime->TakeFresh())
@@ -6972,6 +7146,14 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
         lastPrecision = precision;
     }
     DlssNrNative::SetPrecision(precision);
+
+    if (!cfg.DlssNrEnabled.value_or_default())
+    {
+        if (ReleaseWhileOff(cmdList, timingQueue != nullptr ? submissionEpoch : State::Instance().frameCount))
+            DeferredSr::ReleaseWhileOff(); // Deferred DLSS keeps its own model and surfaces
+    }
+    else
+        g_offSince = {};
 
     // A game with several DLSS features alive (DlssNr_Contexts.h): the main one goes on as before, another stands aside
     // or works in a view slot of its own. First of all, since everything below keeps one model and one history.
@@ -7166,7 +7348,7 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
         {
             DeferredSr::Cancel();
             Late::Cancel();
-            Late::Say("This option needs a native DirectX 12 game.");
+            Late::Say("Finished Picture needs a native DirectX 12 or Vulkan game.");
             return;
         }
         // Refuse before capture, pre-SR NR and private DLSS, not only when Present discards output.
@@ -7837,9 +8019,19 @@ void CurrentModelSize(unsigned int& width, unsigned int& height)
     height = g_nr.workHeight;
 }
 
-std::optional<double> LastGpuTime() { return g_lastGpuTime; }
+// Only a time measured in the last 2 s, so a switch between this engine and the native Vulkan model (Finished Picture
+// on a Vulkan game) never shows the other one's last number
+std::optional<double> LastGpuTime()
+{
+    const long long now =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
 
+    if (now - g_lastGpuTimeAtMs.load(std::memory_order_relaxed) > 2000)
+        return std::nullopt;
 
+    return g_lastGpuTime;
+}
 
 void RequestCapture(unsigned int frames)
 {
@@ -8129,6 +8321,31 @@ void Shutdown()
 
     Late::nativeHdr = {};
     g_compose.reset();
+}
+
+bool ReleaseFinishedIdle(ID3D12GraphicsCommandList* cmd, unsigned long long epoch)
+{
+    std::lock_guard<std::recursive_mutex> lock(g_nrMutex);
+
+    // The same release as NR switched off for kOffRelease, started now
+    const auto saved = g_offSince;
+    g_offSince = std::chrono::steady_clock::now() - kOffRelease - std::chrono::seconds(1);
+    ReleaseWhileOff(cmd, epoch);
+    g_offSince = saved;
+
+    bool holds = g_nrRetired.Size() != 0;
+    for (int slot = -1; slot < (int) kAllSlots && !holds; ++slot)
+        holds = SlotHolds(slot);
+
+    if (!holds)
+    {
+        Late::nativeHdr = {};
+        Late::nativeReset = true;
+        Late::gameGuidesApplied = 0;
+        g_compose.reset();
+    }
+
+    return holds;
 }
 } // namespace DlssNr
 

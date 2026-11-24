@@ -7,7 +7,8 @@ cbuffer Params : register(b0)
     uint width, height;
 };
 Texture2D<float> Field : register(t0);
-RWTexture2D<float> Mask : register(u0);
+#include "VkFormat.hlsli"
+VK_FORMAT("r32f") RWTexture2D<float> Mask : register(u0);
 [numthreads(8, 8, 1)] void GhostBiasMask(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= width || id.y >= height)

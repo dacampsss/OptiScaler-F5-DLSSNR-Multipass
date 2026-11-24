@@ -4,6 +4,15 @@
 #include "precompile/dlssnr.hlsl"
 #undef gModel
 #undef gAux2
+#if defined(VK_PRIVATE_TARGETS)
+// Vulkan: the frozen file's two storage targets (renamed away by the wrapper, unused here) are declared again with the
+// formats of the images bound to them: the carrier in RGBA16F, the second target (the exact motion, the feather rings) in
+// RGBA32F.
+#undef gTarget
+#undef gKeep
+[[vk::image_format("rgba16f")]] [[vk::binding(5, 0)]] RWTexture2D<float4> gTarget : register(u0);
+[[vk::image_format("rgba32f")]] [[vk::binding(6, 0)]] RWTexture2D<float4> gKeep : register(u1);
+#endif
 #include "GhostDepth.hlsli"
 
 float3 CurrentEdit(int2 pixel)

@@ -19,6 +19,259 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
+#include <cstdio>
+#include <cstring>
+
+// Model weights selector. The model reads its weights when a feature is
+// created: FindResourceA(module, "WEIGHTS_...", RT_RCDATA), LoadResource, LockResource, SizeofResource. Only this
+// module's import table is patched (no global hook); when the host has selected a weight set folder, a resource
+// is answered from <folder>\<name>.<CRC32 of the stock resource, 8 hex>.bin. The CRC ties a file to the exact
+// stock data it was made from (some modified DLSS-NR DLLs keep the names but store the records in another layout), and
+// the file must be the stock size. Anything else -> the stock weights and a log line. The DLL on disk is never changed.
+// The patch is on the loaded module: in a game that loads the same nvngx_dlssnr.dll for its own Neural Rendering,
+// features the game creates after a set is chosen get the set too.
+namespace nrweights
+{
+
+std::mutex g_mutex;
+std::wstring g_dirA; // Model A (WEIGHTS_HT or WEIGHTS_PL), empty = stock
+std::wstring g_dirB; // Model B (WEIGHTS_CC_SMALL_FP8*), empty = stock
+std::string g_log;   // taken by the host (dlssnr_weights_take_log)
+std::unordered_set<HMODULE> g_patched;
+std::map<std::pair<HMODULE, std::string>, unsigned> g_stockCrc;
+// Served copies stay alive for the process: the model may keep the pointer it locked (the stock one is in the
+// image and never goes away), so a buffer is never freed under it. Keyed by file path, so a set is read once.
+std::map<std::wstring, std::vector<unsigned char>> g_files;
+std::unordered_map<HGLOBAL, const unsigned char*> g_served; // the model's LoadResource handle -> our copy
+unsigned g_reads = 0;
+
+using PFN_FindResourceA = HRSRC(WINAPI*)(HMODULE, LPCSTR, LPCSTR);
+using PFN_LockResource = LPVOID(WINAPI*)(HGLOBAL);
+
+void log(const std::string& line)
+{
+    if (g_log.size() < 64 * 1024)
+        g_log += line + "\n";
+}
+
+unsigned crc32(const unsigned char* data, size_t size)
+{
+    static unsigned table[256];
+    static std::once_flag once;
+    std::call_once(once,
+                   []
+                   {
+                       for (unsigned i = 0; i < 256; i++)
+                       {
+                           unsigned c = i;
+                           for (int k = 0; k < 8; k++)
+                               c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+                           table[i] = c;
+                       }
+                   });
+    unsigned c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < size; i++)
+        c = table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+std::string narrow(const std::wstring& w)
+{
+    std::string s;
+    for (wchar_t c : w)
+        s += c < 128 ? (char) c : '?';
+    return s;
+}
+
+enum class Read
+{
+    Ok,
+    Missing,
+    WrongSize,
+    Failed
+};
+
+// Only a file of the stock size is read and kept (a wrong one is left on disk and asked again next time).
+const std::vector<unsigned char>* readFile(const std::wstring& path, DWORD expected, Read& result, long long& onDisk)
+{
+    auto found = g_files.find(path);
+    if (found != g_files.end())
+    {
+        result = Read::Ok;
+        return &found->second;
+    }
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        result = Read::Missing;
+        return nullptr;
+    }
+    LARGE_INTEGER size {};
+    std::vector<unsigned char> data;
+    bool ok = GetFileSizeEx(file, &size) != 0;
+    onDisk = ok ? size.QuadPart : -1;
+    if (ok && size.QuadPart != (long long) expected)
+    {
+        CloseHandle(file);
+        result = Read::WrongSize;
+        return nullptr;
+    }
+    if (ok)
+    {
+        data.resize((size_t) size.QuadPart);
+        DWORD got = 0;
+        ok = ReadFile(file, data.data(), (DWORD) data.size(), &got, nullptr) && got == data.size();
+    }
+    CloseHandle(file);
+    if (!ok)
+    {
+        result = Read::Failed;
+        return nullptr;
+    }
+    result = Read::Ok;
+    return &(g_files[path] = std::move(data));
+}
+
+HRSRC WINAPI hkFindResourceA(HMODULE module, LPCSTR name, LPCSTR type)
+{
+    HRSRC resource = FindResourceA(module, name, type);
+    if (resource == nullptr || IS_INTRESOURCE(name) || type != MAKEINTRESOURCEA(10) ||
+        strncmp(name, "WEIGHTS_", 8) != 0)
+        return resource;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    HGLOBAL handle = LoadResource(module, resource); // the same handle the model's own LoadResource gets
+    g_served.erase(handle);
+    // The resource name exactly (a set's files are <name>.<CRC32>.bin, which is what OptiScaler lists them by)
+    // WEIGHTS_PL is Model A under that name in some modified DLSS-NR DLLs
+    const bool isA = strcmp(name, "WEIGHTS_HT") == 0 || strcmp(name, "WEIGHTS_PL") == 0;
+    const bool isB = strcmp(name, "WEIGHTS_CC_SMALL_FP8") == 0;
+    const std::wstring& setDir = isA ? g_dirA : g_dirB;
+    if (!isA && !isB) // a resource that belongs to neither model: always the DLL's own
+    {
+        if (!g_dirA.empty() || !g_dirB.empty())
+            log("read " + std::string(name) + ": stock (not a Model A or Model B weights resource)");
+        return resource;
+    }
+    if (setDir.empty()) // the DLL's own weights: nothing to say, most players never pick a set
+        return resource;
+    g_reads++;
+    const std::string head = std::string(isA ? "Model A" : "Model B") + " weights, read " + std::string(name) + " #" +
+                             std::to_string(g_reads) + ": ";
+
+    const auto* stock = (const unsigned char*) LockResource(handle);
+    const DWORD size = SizeofResource(module, resource);
+    if (stock == nullptr || size == 0)
+    {
+        log(head + "stock (the model's own resource could not be read)");
+        return resource;
+    }
+    // Keyed by module: the forwarder never unloads the model DLL, so a module handle names one DLL for the process
+    auto key = std::make_pair(module, std::string(name));
+    auto crc = g_stockCrc.find(key);
+    if (crc == g_stockCrc.end())
+        crc = g_stockCrc.emplace(key, crc32(stock, size)).first;
+
+    char file[96];
+    snprintf(file, sizeof(file), "%s.%08X.bin", name, crc->second);
+    const std::wstring path = setDir + L"\\" + std::wstring(file, file + strlen(file));
+    Read result = Read::Failed;
+    long long onDisk = -1;
+    const auto* data = readFile(path, size, result, onDisk);
+    if (data != nullptr)
+    {
+        g_served[handle] = data->data();
+        log(head + "served " + narrow(path));
+    }
+    else if (result == Read::Missing)
+    {
+        log(head + "stock (no " + narrow(path) + ")");
+    }
+    else if (result == Read::WrongSize)
+    {
+        log(head + "stock (" + narrow(path) + " is " + std::to_string(onDisk) + " bytes, the model's is " +
+            std::to_string(size) + ")");
+    }
+    else
+    {
+        log(head + "stock (" + narrow(path) + " could not be read)");
+    }
+    return resource;
+}
+
+LPVOID WINAPI hkLockResource(HGLOBAL handle)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto found = g_served.find(handle);
+        if (found != g_served.end())
+            return (LPVOID) found->second;
+    }
+    return LockResource(handle);
+}
+
+bool patchImport(HMODULE module, const char* importName, void* detour)
+{
+    auto* base = (unsigned char*) module;
+    auto* dos = (IMAGE_DOS_HEADER*) base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    auto* nt = (IMAGE_NT_HEADERS*) (base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return false;
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (dir.VirtualAddress == 0)
+        return false;
+    bool patched = false;
+    for (auto* desc = (IMAGE_IMPORT_DESCRIPTOR*) (base + dir.VirtualAddress); desc->Name != 0; ++desc)
+    {
+        if (desc->OriginalFirstThunk == 0)
+            continue;
+        auto* names = (IMAGE_THUNK_DATA*) (base + desc->OriginalFirstThunk);
+        auto* iat = (IMAGE_THUNK_DATA*) (base + desc->FirstThunk);
+        for (size_t i = 0; iat[i].u1.Function != 0; ++i)
+        {
+            if (names[i].u1.Ordinal & IMAGE_ORDINAL_FLAG)
+                continue;
+            auto* byName = (IMAGE_IMPORT_BY_NAME*) (base + names[i].u1.AddressOfData);
+            if (strcmp((const char*) byName->Name, importName) != 0)
+                continue;
+            DWORD old = 0;
+            if (!VirtualProtect(&iat[i].u1.Function, sizeof(void*), PAGE_READWRITE, &old))
+                continue;
+            iat[i].u1.Function = (ULONG_PTR) detour;
+            VirtualProtect(&iat[i].u1.Function, sizeof(void*), old, &old);
+            patched = true;
+        }
+    }
+    return patched;
+}
+
+// Called right after the model DLL is loaded, before any feature is created.
+void watch(HMODULE module)
+{
+    if (module == nullptr)
+        return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_patched.insert(module).second)
+        return;
+    const bool find = patchImport(module, "FindResourceA", (void*) &hkFindResourceA);
+    const bool lockRes = patchImport(module, "LockResource", (void*) &hkLockResource);
+    log(find && lockRes ? "weights selector ready on the model DLL"
+                        : "weights selector NOT available: the model DLL does not import FindResourceA/LockResource");
+}
+
+// A folder as the host gives it, without a trailing separator
+std::wstring trimDir(const wchar_t* dir)
+{
+    std::wstring d = dir ? dir : L"";
+    while (!d.empty() && (d.back() == L'\\' || d.back() == L'/'))
+        d.pop_back();
+    return d;
+}
+
+} // namespace nrweights
 
 namespace {
 
@@ -104,6 +357,7 @@ Snippet* loadSnippet(const wchar_t *path) {
     if (!snippet.module) {
         return nullptr;
     }
+    nrweights::watch(snippet.module);
     snippet.init = (PFN_NrInitExt) GetProcAddress(snippet.module, "NVSDK_NGX_D3D12_Init_Ext");
     snippet.create = (PFN_NrCreate) GetProcAddress(snippet.module, "NVSDK_NGX_D3D12_CreateFeature");
     snippet.evaluate = (PFN_NrEvaluate) GetProcAddress(snippet.module, "NVSDK_NGX_D3D12_EvaluateFeature");
@@ -191,6 +445,7 @@ bool loadVkSnippet(const wchar_t *path) {
     if (!g_vk.module) {
         return false;
     }
+    nrweights::watch(g_vk.module);
 
     g_vk.init = (PFN_NrVkInitExt) GetProcAddress(g_vk.module, "NVSDK_NGX_VULKAN_Init_Ext");
     g_vk.create = (PFN_NrVkCreate) GetProcAddress(g_vk.module, "NVSDK_NGX_VULKAN_CreateFeature");
@@ -370,6 +625,7 @@ bool loadD3D11Snippet(const wchar_t *path) {
     if (!g_d3d11.module) {
         return false;
     }
+    nrweights::watch(g_d3d11.module);
 
     g_d3d11.init = (PFN_NrD3D11Init) GetProcAddress(g_d3d11.module, "NVSDK_NGX_D3D11_Init_Ext");
     g_d3d11.create = (PFN_NrD3D11Create) GetProcAddress(g_d3d11.module, "NVSDK_NGX_D3D11_CreateFeature");
@@ -968,6 +1224,34 @@ __declspec(dllexport) void dlssnr_call_release(void *feature) {
         (void) result;
         g_featureOwners.erase(owner);
     }
+}
+
+// Model weights selector: the folders the next feature creates read their weights from, one per model
+// (dirA = Model A, WEIGHTS_HT or WEIGHTS_PL; dirB = Model B, WEIGHTS_CC_SMALL_FP8*; null or empty = the model DLL's
+// own). Takes effect at the next create; features already built keep what they were built with.
+__declspec(dllexport) void dlssnr_weights_select2(const wchar_t* dirA, const wchar_t* dirB)
+{
+    std::lock_guard<std::mutex> lock(nrweights::g_mutex);
+    nrweights::g_dirA = nrweights::trimDir(dirA);
+    nrweights::g_dirB = nrweights::trimDir(dirB);
+}
+
+// The first version of the selector (older OptiScaler builds): one folder for both models.
+__declspec(dllexport) void dlssnr_weights_select(const wchar_t* setDir) { dlssnr_weights_select2(setDir, setDir); }
+
+// What the selector did since the last call (one line per weights read), copied into the host's buffer and
+// cleared. Returns the length written (the text is cut to fit and always terminated).
+__declspec(dllexport) int dlssnr_weights_take_log(char* buffer, int size)
+{
+    std::lock_guard<std::mutex> lock(nrweights::g_mutex);
+    if (!buffer || size <= 0)
+        return 0;
+    const size_t room = (size_t) size - 1;
+    const int n = (int) (nrweights::g_log.size() < room ? nrweights::g_log.size() : room);
+    memcpy(buffer, nrweights::g_log.data(), (size_t) n);
+    buffer[n] = 0;
+    nrweights::g_log.clear();
+    return n;
 }
 
 } // extern "C"

@@ -24,6 +24,8 @@
 
 #include <dxgi1_6.h>
 #include <misc/IdentifyGpu.h>
+#include <misc/GpuMemory.h>
+#include <misc/GpuMemTally.h>
 
 #include "Hook_Utils.h"
 
@@ -33,6 +35,11 @@ using PFN_CheckFeatureSupport = rewrite_signature<decltype(&ID3D12Device::CheckF
 using PFN_CreateSampler = rewrite_signature<decltype(&ID3D12Device::CreateSampler)>::type;
 using PFN_CreateCommittedResource = rewrite_signature<decltype(&ID3D12Device::CreateCommittedResource)>::type;
 using PFN_CreatePlacedResource = rewrite_signature<decltype(&ID3D12Device::CreatePlacedResource)>::type;
+using PFN_CreateHeap = rewrite_signature<decltype(&ID3D12Device::CreateHeap)>::type;
+using PFN_CreateCommittedResource1 = rewrite_signature<decltype(&ID3D12Device4::CreateCommittedResource1)>::type;
+using PFN_CreateHeap1 = rewrite_signature<decltype(&ID3D12Device4::CreateHeap1)>::type;
+using PFN_CreateCommittedResource2 = rewrite_signature<decltype(&ID3D12Device8::CreateCommittedResource2)>::type;
+using PFN_CreateCommittedResource3 = rewrite_signature<decltype(&ID3D12Device10::CreateCommittedResource3)>::type;
 using PFN_SetResidencyPriority = rewrite_signature<decltype(&ID3D12Device1::SetResidencyPriority)>::type;
 using PFN_CreateRootSignature = rewrite_signature<decltype(&ID3D12Device::CreateRootSignature)>::type;
 
@@ -53,6 +60,11 @@ static PFN_CreateSampler o_CreateSampler = nullptr;
 static PFN_CheckFeatureSupport o_CheckFeatureSupport = nullptr;
 static PFN_CreateCommittedResource o_CreateCommittedResource = nullptr;
 static PFN_CreatePlacedResource o_CreatePlacedResource = nullptr;
+static PFN_CreateHeap o_CreateHeap = nullptr;
+static PFN_CreateCommittedResource1 o_CreateCommittedResource1 = nullptr;
+static PFN_CreateHeap1 o_CreateHeap1 = nullptr;
+static PFN_CreateCommittedResource2 o_CreateCommittedResource2 = nullptr;
+static PFN_CreateCommittedResource3 o_CreateCommittedResource3 = nullptr;
 static PFN_SetResidencyPriority o_SetResidencyPriority = nullptr;
 static PFN_GetResourceAllocationInfo o_GetResourceAllocationInfo = nullptr;
 static PFN_CreateRootSignature o_CreateRootSignature = nullptr;
@@ -1888,6 +1900,172 @@ static HRESULT hkCheckFeatureSupport(ID3D12Device* device, D3D12_FEATURE Feature
     return result;
 }
 
+// GPU memory by module (misc/GpuMemory.h). Placed resources are not counted, their heap is. A hooked entry point can be
+// reached from another hooked one inside D3D12: only the outermost call counts, with the caller's return address.
+static thread_local int t_gpuMemDepth = 0;
+
+struct GpuMemScope
+{
+    bool outer;
+    GpuMemScope() : outer(t_gpuMemDepth++ == 0) {}
+    ~GpuMemScope() { --t_gpuMemDepth; }
+};
+
+// What a committed resource costs. A buffer is its size rounded up to 64 KB, anything else asks the driver
+// (the original GetResourceAllocationInfo, not our hook). D3D12_RESOURCE_DESC1 starts with a D3D12_RESOURCE_DESC.
+static uint64_t GpuMemCommittedBytes(ID3D12Device* device, const D3D12_RESOURCE_DESC* desc)
+{
+    if (desc == nullptr)
+        return 0;
+
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        return gpumem::AlignUp(desc->Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+
+    if (o_GetResourceAllocationInfo == nullptr)
+        return 0;
+
+    D3D12_RESOURCE_DESC local = *desc;
+    D3D12_RESOURCE_ALLOCATION_INFO info {};
+    o_GetResourceAllocationInfo(device, &info, 0, 1, &local);
+    return info.SizeInBytes == UINT64_MAX ? 0 : info.SizeInBytes;
+}
+
+// [Memory] ProtectMemory: the original SetResidencyPriority (not our hook) with HIGH on a new heap or committed
+// resource of one of our modules. Failure is tolerated and logged once (AMD 25.20 drivers answer E_INVALIDARG).
+static bool GpuMemProtect(IUnknown* object)
+{
+    if (o_SetResidencyPriority == nullptr)
+        return false;
+
+    ID3D12Pageable* pageable = nullptr;
+    if (FAILED(object->QueryInterface(IID_PPV_ARGS(&pageable))) || pageable == nullptr)
+        return false;
+
+    ID3D12Device1* device1 = nullptr;
+    HRESULT hr = pageable->GetDevice(IID_PPV_ARGS(&device1));
+    if (SUCCEEDED(hr) && device1 != nullptr)
+    {
+        const D3D12_RESIDENCY_PRIORITY priority = D3D12_RESIDENCY_PRIORITY_HIGH;
+        hr = o_SetResidencyPriority(device1, 1, &pageable, &priority);
+        device1->Release();
+    }
+
+    pageable->Release();
+
+    static std::atomic<bool> warned { false };
+    if (FAILED(hr) && !warned.exchange(true))
+        LOG_WARN("ProtectMemory: SetResidencyPriority failed ({:X}), allocations stay at the normal priority",
+                 (UINT) hr);
+
+    return SUCCEEDED(hr);
+}
+
+static void GpuMemNoteCommitted(ID3D12Device* device, const D3D12_HEAP_PROPERTIES* heap,
+                                const D3D12_RESOURCE_DESC* desc, HRESULT created, void** ppv, void* caller)
+{
+    if (FAILED(created) || ppv == nullptr || *ppv == nullptr || heap == nullptr)
+        return;
+
+    GpuMemory::NoteDevice(device);
+
+    const uint64_t bytes = GpuMemory::Active() ? GpuMemCommittedBytes(device, desc) : 0;
+    const bool protect = GpuMemory::ShouldProtect((int) heap->Type, (int) heap->MemoryPoolPreference, caller) &&
+                         GpuMemProtect((IUnknown*) *ppv);
+    GpuMemory::Note((IUnknown*) *ppv, bytes, (int) heap->Type, (int) heap->MemoryPoolPreference, caller,
+                    protect ? bytes : 0);
+}
+
+static void GpuMemNoteHeap(const D3D12_HEAP_DESC* desc, HRESULT created, void** ppv, void* caller)
+{
+    if (FAILED(created) || ppv == nullptr || *ppv == nullptr || desc == nullptr)
+        return;
+
+    const bool protect =
+        GpuMemory::ShouldProtect((int) desc->Properties.Type, (int) desc->Properties.MemoryPoolPreference, caller) &&
+        GpuMemProtect((IUnknown*) *ppv);
+    GpuMemory::Note((IUnknown*) *ppv, desc->SizeInBytes, (int) desc->Properties.Type,
+                    (int) desc->Properties.MemoryPoolPreference, caller, protect ? desc->SizeInBytes : 0);
+}
+
+VALIDATE_HOOK(hkCreateHeap, PFN_CreateHeap)
+static HRESULT hkCreateHeap(ID3D12Device* device, const D3D12_HEAP_DESC* pDesc, REFIID riid, void** ppvHeap)
+{
+    void* caller = _ReturnAddress();
+    GpuMemScope scope;
+    const HRESULT created = o_CreateHeap(device, pDesc, riid, ppvHeap);
+    if (scope.outer)
+        GpuMemNoteHeap(pDesc, created, ppvHeap, caller);
+    return created;
+}
+
+VALIDATE_HOOK(hkCreateHeap1, PFN_CreateHeap1)
+static HRESULT hkCreateHeap1(ID3D12Device4* device, const D3D12_HEAP_DESC* pDesc,
+                             ID3D12ProtectedResourceSession* pProtectedSession, REFIID riid, void** ppvHeap)
+{
+    void* caller = _ReturnAddress();
+    GpuMemScope scope;
+    const HRESULT created = o_CreateHeap1(device, pDesc, pProtectedSession, riid, ppvHeap);
+    if (scope.outer)
+        GpuMemNoteHeap(pDesc, created, ppvHeap, caller);
+    return created;
+}
+
+VALIDATE_HOOK(hkCreateCommittedResource1, PFN_CreateCommittedResource1)
+static HRESULT hkCreateCommittedResource1(ID3D12Device4* device, const D3D12_HEAP_PROPERTIES* pHeapProperties,
+                                          D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC* pDesc,
+                                          D3D12_RESOURCE_STATES InitialResourceState,
+                                          const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+                                          ID3D12ProtectedResourceSession* pProtectedSession, REFIID riidResource,
+                                          void** ppvResource)
+{
+    void* caller = _ReturnAddress();
+    GpuMemScope scope;
+    const HRESULT created =
+        o_CreateCommittedResource1(device, pHeapProperties, HeapFlags, pDesc, InitialResourceState,
+                                   pOptimizedClearValue, pProtectedSession, riidResource, ppvResource);
+    if (scope.outer)
+        GpuMemNoteCommitted(device, pHeapProperties, pDesc, created, ppvResource, caller);
+    return created;
+}
+
+VALIDATE_HOOK(hkCreateCommittedResource2, PFN_CreateCommittedResource2)
+static HRESULT hkCreateCommittedResource2(ID3D12Device8* device, const D3D12_HEAP_PROPERTIES* pHeapProperties,
+                                          D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC1* pDesc,
+                                          D3D12_RESOURCE_STATES InitialResourceState,
+                                          const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+                                          ID3D12ProtectedResourceSession* pProtectedSession, REFIID riidResource,
+                                          void** ppvResource)
+{
+    void* caller = _ReturnAddress();
+    GpuMemScope scope;
+    const HRESULT created =
+        o_CreateCommittedResource2(device, pHeapProperties, HeapFlags, pDesc, InitialResourceState,
+                                   pOptimizedClearValue, pProtectedSession, riidResource, ppvResource);
+    if (scope.outer)
+        GpuMemNoteCommitted(device, pHeapProperties, reinterpret_cast<const D3D12_RESOURCE_DESC*>(pDesc), created,
+                            ppvResource, caller);
+    return created;
+}
+
+VALIDATE_HOOK(hkCreateCommittedResource3, PFN_CreateCommittedResource3)
+static HRESULT hkCreateCommittedResource3(ID3D12Device10* device, const D3D12_HEAP_PROPERTIES* pHeapProperties,
+                                          D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC1* pDesc,
+                                          D3D12_BARRIER_LAYOUT InitialLayout,
+                                          const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+                                          ID3D12ProtectedResourceSession* pProtectedSession, UINT32 NumCastableFormats,
+                                          const DXGI_FORMAT* pCastableFormats, REFIID riidResource, void** ppvResource)
+{
+    void* caller = _ReturnAddress();
+    GpuMemScope scope;
+    const HRESULT created =
+        o_CreateCommittedResource3(device, pHeapProperties, HeapFlags, pDesc, InitialLayout, pOptimizedClearValue,
+                                   pProtectedSession, NumCastableFormats, pCastableFormats, riidResource, ppvResource);
+    if (scope.outer)
+        GpuMemNoteCommitted(device, pHeapProperties, reinterpret_cast<const D3D12_RESOURCE_DESC*>(pDesc), created,
+                            ppvResource, caller);
+    return created;
+}
+
 VALIDATE_HOOK(hkCreateCommittedResource, PFN_CreateCommittedResource)
 static HRESULT hkCreateCommittedResource(ID3D12Device* device, const D3D12_HEAP_PROPERTIES* pHeapProperties,
                                          D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC* pDesc,
@@ -1916,9 +2094,14 @@ static HRESULT hkCreateCommittedResource(ID3D12Device* device, const D3D12_HEAP_
         }
     }
 
+    void* caller = _ReturnAddress();
+    GpuMemScope gpuMemScope;
     const HRESULT created = o_CreateCommittedResource(device, pHeapProperties, HeapFlags, pDesc,
                                                       InitialResourceState, pOptimizedClearValue,
                                                       riidResource, ppvResource);
+
+    if (gpuMemScope.outer)
+        GpuMemNoteCommitted(device, pHeapProperties, pDesc, created, ppvResource, caller);
 
     // Where the exposure scan sees the game's resources. Silent and cheap for everything that does
     // not match, and it does nothing at all unless Neural Rendering is running.
@@ -1968,6 +2151,11 @@ static HRESULT hkSetResidencyPriority(ID3D12Device1* This, UINT NumObjects, ID3D
                                       const D3D12_RESIDENCY_PRIORITY* pPriorities)
 {
     auto result = o_SetResidencyPriority(This, NumObjects, ppObjects, pPriorities);
+
+    // Who asks for which priority, for the GPU memory log (our own ProtectMemory calls go to the original, not here)
+    if (GpuMemory::Active())
+        GpuMemory::NoteResidency(NumObjects, reinterpret_cast<IUnknown* const*>(ppObjects), pPriorities,
+                                 _ReturnAddress());
 
     // HACK: AMD Windows 25.20 drivers fail in xess/xefg with E_INVALIDARG
     // This hack allows them to work without the priority being actually set
@@ -2307,6 +2495,37 @@ static void HookToDevice(ID3D12Device* InDevice)
     o_CreateCommittedResource = (PFN_CreateCommittedResource) pVTable[27];
     o_CreatePlacedResource = (PFN_CreatePlacedResource) pVTable[29];
 
+    // GPU memory by module: every allocation path of the device, only when the log line is wanted
+    if (GpuMemory::Init())
+    {
+        IUnknown* source = realDevice ? (IUnknown*) realDevice : (IUnknown*) InDevice;
+        o_CreateHeap = (PFN_CreateHeap) pVTable[28];
+
+        // Newer interfaces only when the device has them
+        ID3D12Device4* device4 = nullptr;
+        if (SUCCEEDED(source->QueryInterface(IID_PPV_ARGS(&device4))))
+        {
+            PVOID* vt = *(PVOID**) device4;
+            o_CreateCommittedResource1 = (PFN_CreateCommittedResource1) vt[53];
+            o_CreateHeap1 = (PFN_CreateHeap1) vt[54];
+            device4->Release();
+        }
+
+        ID3D12Device8* device8 = nullptr;
+        if (SUCCEEDED(source->QueryInterface(IID_PPV_ARGS(&device8))))
+        {
+            o_CreateCommittedResource2 = (PFN_CreateCommittedResource2) (*(PVOID**) device8)[69];
+            device8->Release();
+        }
+
+        ID3D12Device10* device10 = nullptr;
+        if (SUCCEEDED(source->QueryInterface(IID_PPV_ARGS(&device10))))
+        {
+            o_CreateCommittedResource3 = (PFN_CreateCommittedResource3) (*(PVOID**) device10)[76];
+            device10->Release();
+        }
+    }
+
     ID3D12Device1* device12_1 = nullptr;
     if (realDevice)
         realDevice->QueryInterface(IID_PPV_ARGS(&device12_1));
@@ -2385,6 +2604,41 @@ static void HookToDevice(ID3D12Device* InDevice)
             o_D3D12DeviceRelease = nullptr;
             o_GetResourceAllocationInfo = nullptr;
         }
+
+        // GPU memory log / ProtectMemory: their own transaction, so a slot an overlay or anti-cheat already patched
+        // only costs these five hooks, never the device hooks above (they run in every D3D12 game since auto = fg)
+        if (o_CreateHeap != nullptr || o_CreateCommittedResource1 != nullptr || o_CreateHeap1 != nullptr ||
+            o_CreateCommittedResource2 != nullptr || o_CreateCommittedResource3 != nullptr)
+        {
+            DetourTransactionBegin();
+            DetourUpdateThread(GetCurrentThread());
+
+            if (o_CreateHeap != nullptr)
+                DetourAttach(&(PVOID&) o_CreateHeap, hkCreateHeap);
+
+            if (o_CreateCommittedResource1 != nullptr)
+                DetourAttach(&(PVOID&) o_CreateCommittedResource1, hkCreateCommittedResource1);
+
+            if (o_CreateHeap1 != nullptr)
+                DetourAttach(&(PVOID&) o_CreateHeap1, hkCreateHeap1);
+
+            if (o_CreateCommittedResource2 != nullptr)
+                DetourAttach(&(PVOID&) o_CreateCommittedResource2, hkCreateCommittedResource2);
+
+            if (o_CreateCommittedResource3 != nullptr)
+                DetourAttach(&(PVOID&) o_CreateCommittedResource3, hkCreateCommittedResource3);
+
+            if (const auto gpuMemResult = DetourTransactionCommit(); gpuMemResult != NO_ERROR)
+            {
+                LOG_WARN("GPU memory hooks not installed (error {:X}): no GPU memory log, ProtectMemory off",
+                         gpuMemResult);
+                o_CreateHeap = nullptr;
+                o_CreateCommittedResource1 = nullptr;
+                o_CreateHeap1 = nullptr;
+                o_CreateCommittedResource2 = nullptr;
+                o_CreateCommittedResource3 = nullptr;
+            }
+        }
     }
 
     HookToCommandList(InDevice);
@@ -2427,6 +2681,21 @@ static void UnhookDevice()
     if (o_CreatePlacedResource != nullptr)
         DetourDetach(&(PVOID&) o_CreatePlacedResource, hkCreatePlacedResource);
 
+    if (o_CreateHeap != nullptr)
+        DetourDetach(&(PVOID&) o_CreateHeap, hkCreateHeap);
+
+    if (o_CreateCommittedResource1 != nullptr)
+        DetourDetach(&(PVOID&) o_CreateCommittedResource1, hkCreateCommittedResource1);
+
+    if (o_CreateHeap1 != nullptr)
+        DetourDetach(&(PVOID&) o_CreateHeap1, hkCreateHeap1);
+
+    if (o_CreateCommittedResource2 != nullptr)
+        DetourDetach(&(PVOID&) o_CreateCommittedResource2, hkCreateCommittedResource2);
+
+    if (o_CreateCommittedResource3 != nullptr)
+        DetourDetach(&(PVOID&) o_CreateCommittedResource3, hkCreateCommittedResource3);
+
     if (o_D3D12DeviceRelease != nullptr)
         DetourDetach(&(PVOID&) o_D3D12DeviceRelease, hkD3D12DeviceRelease);
 
@@ -2444,6 +2713,11 @@ static void UnhookDevice()
         o_CheckFeatureSupport = nullptr;
         o_CreateCommittedResource = nullptr;
         o_CreatePlacedResource = nullptr;
+        o_CreateHeap = nullptr;
+        o_CreateCommittedResource1 = nullptr;
+        o_CreateHeap1 = nullptr;
+        o_CreateCommittedResource2 = nullptr;
+        o_CreateCommittedResource3 = nullptr;
         o_D3D12DeviceRelease = nullptr;
         o_GetResourceAllocationInfo = nullptr;
     }
@@ -2516,6 +2790,21 @@ void D3D12Hooks::Unhook()
     if (o_CreatePlacedResource != nullptr)
         DetourDetach(&(PVOID&) o_CreatePlacedResource, hkCreatePlacedResource);
 
+    if (o_CreateHeap != nullptr)
+        DetourDetach(&(PVOID&) o_CreateHeap, hkCreateHeap);
+
+    if (o_CreateCommittedResource1 != nullptr)
+        DetourDetach(&(PVOID&) o_CreateCommittedResource1, hkCreateCommittedResource1);
+
+    if (o_CreateHeap1 != nullptr)
+        DetourDetach(&(PVOID&) o_CreateHeap1, hkCreateHeap1);
+
+    if (o_CreateCommittedResource2 != nullptr)
+        DetourDetach(&(PVOID&) o_CreateCommittedResource2, hkCreateCommittedResource2);
+
+    if (o_CreateCommittedResource3 != nullptr)
+        DetourDetach(&(PVOID&) o_CreateCommittedResource3, hkCreateCommittedResource3);
+
     if (o_GetResourceAllocationInfo != nullptr)
         DetourDetach(&(PVOID&) o_GetResourceAllocationInfo, hkGetResourceAllocationInfo);
 
@@ -2533,6 +2822,11 @@ void D3D12Hooks::Unhook()
         o_CheckFeatureSupport = nullptr;
         o_CreateCommittedResource = nullptr;
         o_CreatePlacedResource = nullptr;
+        o_CreateHeap = nullptr;
+        o_CreateCommittedResource1 = nullptr;
+        o_CreateHeap1 = nullptr;
+        o_CreateCommittedResource2 = nullptr;
+        o_CreateCommittedResource3 = nullptr;
         o_D3D12DeviceRelease = nullptr;
         o_GetResourceAllocationInfo = nullptr;
     }

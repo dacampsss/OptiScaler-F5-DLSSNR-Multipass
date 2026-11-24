@@ -25,8 +25,9 @@ Texture2D<float4> OldReference : register(t2);
 Texture2D<float4> Proxy : register(t3);
 Texture2D<float4> Answer : register(t4);
 Texture2D<float> Phase : register(t5);
-RWTexture2D<float4> Raw : register(u0);
-RWTexture2D<float4> Reference : register(u1);
+#include "VkFormat.hlsli"
+VK_FORMAT("rgba16f") RWTexture2D<float4> Raw : register(u0);
+VK_FORMAT("rgba16f") RWTexture2D<float4> Reference : register(u1);
 
 [numthreads(8, 8, 1)] void GhostContrastHistory(uint3 id : SV_DispatchThreadID)
 {

@@ -19,7 +19,8 @@ bool SrUnavailable();
 // The game's NGX D3D12 runtime is shutting down: every NGX handle is about to be destroyed by NGX itself.
 void NgxDx12Shutdown();
 constexpr uint32_t Transfer = 11u;
-// Where Superior cannot run (native Vulkan, no NGX DLSS SR, no depth), the ordinary path runs Matched residual.
+// Where Superior cannot run (no NGX DLSS SR, no depth, or on native Vulkan the cases in DlssNr_SuperiorVkRule.h), the
+// ordinary path runs Matched residual.
 constexpr uint32_t FallbackTransfer = 1u;
 constexpr uint32_t ShaderFlag = 65536u;
 constexpr uint32_t LowGroupHeight = 16u;
@@ -77,9 +78,11 @@ template <class P> inline void SetGuidedRange(P& p, float scale)
     const float inverse = 1.f / (sigma * sigma);
     std::memcpy(&p.ExposureSourceWidth, &inverse, sizeof(inverse));
 }
-inline bool CanSelectUpscaleMode(unsigned mode, float scale, bool nativeVulkan)
+// Superior Scaling is selectable on every route: where it cannot run (see DlssNr_SuperiorVkRule.h for native Vulkan)
+// the ordinary path runs Matched residual and the status line under the combo says why.
+inline bool CanSelectUpscaleMode(unsigned mode, float scale)
 {
-    return mode == Transfer ? !nativeVulkan : mode == 0u || (mode <= 2u && scale < .999f);
+    return mode == Transfer || mode == 0u || (mode <= 2u && scale < .999f);
 }
 // -1 keeps the generic PSO. Specialization changes no user setting or colour calculation.
 // The fallback resolve PSO slot (DlssNr_Dx12::_superiorResolve, 9 slots). The raw (non-temporal) resolve compiles
@@ -209,6 +212,22 @@ inline bool NeedsTemporal(unsigned nativeW, unsigned nativeH, unsigned ordinaryW
         return false;
     return ordinaryW < nativeW || ordinaryH < nativeH ||
            (compressed && ordinaryW == nativeW && ordinaryH == nativeH && (modelW < nativeW || modelH < nativeH));
+}
+// [DlssNr] SuperiorAtNative: the private DLSS also runs at 100% and above. Above 100% the model still supersamples; its
+// answer is averaged back to native (the ordinary down-leg) and the private DLSS steadies that native pair, so its
+// raster is the frame's. Compress screen edges keeps its own rule (NeedsTemporal). Only while a private DLSS can run:
+// with No DLSS (or no NGX DLSS SR) 100% and above stay on the ordinary path, as the greyed-out checkbox says.
+inline bool StabilizeAtNative(bool wanted, float workScale, bool compressed, unsigned savedPreset, bool srUnavailable)
+{
+    return wanted && !compressed && !srUnavailable && Preset(savedPreset) != NoPrivateDlss &&
+           std::isfinite(workScale) && workScale >= 1.0f;
+}
+// Supersampling under StabilizeAtNative: the model raster really is larger than the frame (a scale just above 1 can
+// round back to native, where there is no down-leg).
+inline bool StabilizeSupersampled(bool atNative, unsigned width, unsigned height, unsigned workWidth,
+                                  unsigned workHeight)
+{
+    return atNative && (workWidth > width || workHeight > height);
 }
 // Missing render/output metadata falls back to the original valid motion region, before any resample.
 inline float MotionScale(float gameScale, unsigned motionExtent, unsigned referenceExtent,
