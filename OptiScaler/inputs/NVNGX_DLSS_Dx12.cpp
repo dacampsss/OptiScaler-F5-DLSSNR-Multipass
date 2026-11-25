@@ -31,6 +31,7 @@
 #include "detours/detours.h"
 #include <ankerl/unordered_dense.h>
 #include <misc/IdentifyGpu.h>
+#include <nvapi/CallerModule.h>
 #include <nvapi/DrsCallerRule.h>
 
 static ankerl::unordered_dense::map<unsigned int, ContextData<IFeature_Dx12>> Dx12Contexts;
@@ -1018,13 +1019,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
     bool f5lowAsks = false;
     if (isFG && !dlssgAdjacent)
     {
-        HMODULE caller = nullptr;
-        wchar_t callerPath[MAX_PATH] {};
-        f5lowAsks =
-            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               (LPCWSTR) _ReturnAddress(), &caller) &&
-            GetModuleFileNameW(caller, callerPath, MAX_PATH) != 0 &&
-            drscaller::IsF5LowStreamline(std::filesystem::path(callerPath).filename().wstring());
+        f5lowAsks = drscaller::IsF5LowStreamline(CallerModuleFileName(_ReturnAddress()));
 
         static std::atomic<bool> logged { false };
         if (f5lowAsks && !logged.exchange(true))

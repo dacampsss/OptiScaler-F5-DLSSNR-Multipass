@@ -13,7 +13,10 @@
 #include <misc/IdentifyGpu.h>
 #include <framegen/nvngx/DlssgPresetSupport.h>
 #include <low_latency/input/input_reflex.h>
+#include <nvapi/CallerModule.h>
 #include <nvapi/DrsCallerRule.h>
+
+#include <atomic>
 
 // #define LOG_ALL_DRS_GET_CALLS
 
@@ -154,21 +157,16 @@ NvAPI_Status __stdcall NvApiHooks::hkNvAPI_DRS_GetSetting(NvDRSSessionHandle hSe
 
         // f5low's private Streamline (Frame Generator DLSS-G) loads its own files, never the NVIDIA app's override
         // plugins (DrsCallerRule.h). Only the caller's answer changes: the game's Streamline keeps the override.
-        if (settingId == drscaller::kStreamlineOtaOverrideId && pSetting->settingType == NVDRS_DWORD_TYPE &&
-            pSetting->u32CurrentValue != 0)
+        if (settingId == drscaller::kStreamlineOtaOverrideId && pSetting->version == NVDRS_SETTING_VER &&
+            pSetting->settingType == NVDRS_DWORD_TYPE && pSetting->u32CurrentValue != 0 &&
+            drscaller::AnswerOtaOverrideOff(settingId, CallerModuleFileName(_ReturnAddress())))
         {
-            HMODULE caller = nullptr;
-            wchar_t callerPath[MAX_PATH] {};
-            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   (LPCWSTR) _ReturnAddress(), &caller) &&
-                GetModuleFileNameW(caller, callerPath, MAX_PATH) != 0 &&
-                drscaller::AnswerOtaOverrideOff(settingId, std::filesystem::path(callerPath).filename().wstring()))
-            {
-                pSetting->u32CurrentValue = 0;
+            pSetting->u32CurrentValue = 0;
+
+            static std::atomic<bool> logged { false };
+            if (!logged.exchange(true))
                 LOG_INFO("f5low's Streamline: the NVIDIA app's Streamline override is on; f5low's DLSS-G uses its own "
                          "files instead of the override plugins (the game keeps the override)");
-            }
         }
 #ifdef LOG_ALL_DRS_GET_CALLS
         LOG_TRACE("settingId: {:X}, settingLocation: {}, isCurrentPredefined: {}", settingId,
