@@ -72,6 +72,48 @@ CrossQueueGate::Watchdog& Gate()
     return *watchdog;
 }
 
+// [DlssNr] FinishedGpuWait: may this present queue a GPU wait on the game's render queue? Called once per present.
+// Skyrim (v0.1.40-pre1 tester): the device was reset on the first frames of a DLSS-G context made again after the
+// upscaler was rebuilt, with the present waiting on the gate. Mode 2 keeps the wait off for a settle after frame
+// generation turns on/off/pauses or the upscaler changes; mode 3 keeps it off while OptiScaler's frame generation is
+// attached. Without the wait, frames still rendering at present are skipped, as before #362.
+bool GpuWaitAllowed()
+{
+    const auto mode = Config::Instance()->DlssNrFinishedGpuWait.value_or_default();
+    if (mode == 0)
+        return false;
+    if (mode == 1)
+        return true;
+    auto& state = State::Instance();
+    auto* fg = state.currentFG;
+    if (mode == 3)
+        return fg == nullptr;
+    struct Seen
+    {
+        const void* fg = nullptr;
+        const void* upscaler = nullptr;
+        bool generating = false;
+    };
+    static Seen seen {};
+    static uint32_t presentsSince = 0;
+    static std::chrono::steady_clock::time_point changedAt {};
+    const Seen now { fg, state.currentFeature, fg && fg->IsActive() && !fg->IsPaused() };
+    if (now.fg != seen.fg || now.upscaler != seen.upscaler || now.generating != seen.generating)
+    {
+        if (presentsSince != 0 || seen.fg || seen.upscaler)
+            LOG_INFO("DLSS-NR finished picture: frame generation or the upscaler changed; the present stops waiting "
+                     "on the GPU for a moment (frames still rendering are skipped meanwhile)");
+        seen = now;
+        presentsSince = 0;
+        changedAt = std::chrono::steady_clock::now();
+    }
+    if (presentsSince < UINT32_MAX)
+        ++presentsSince;
+    constexpr uint32_t kSettlePresents = 120;
+    constexpr auto kSettleTime = std::chrono::seconds(2);
+    return presentsSince > kSettlePresents && std::chrono::steady_clock::now() - changedAt >= kSettleTime;
+}
+
 // Slots whose gate the watchdog freed: their guide copy may still be pending and their fence now runs out of order, so
 // they are never used again (pending without a submission: Acquire, Cancel, the reset hook and the resize wait skip
 // them). Costs one of the four slots, once per session.
@@ -630,8 +672,9 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
     // The wait is watched before it is queued (a wait the watchdog could not watch is never queued), and queued before
     // anything is recorded: a later failure below leaves only a wait the gate's own signal ends.
     auto& waiting = Late::slots[index];
+    const bool gpuWaitAllowed = Late::GpuWaitAllowed(); // every present, so the settle counts presents
     if (pick == FinishedPick::NotReady && !inputs[index].sameQueue && inputs[index].completed != UINT64_MAX &&
-        waiting.gated && Late::Gate().Enabled() && Late::Gate().Watch(waiting.gate.Get(), waiting.ready, waiting.serial) &&
+        waiting.gated && gpuWaitAllowed && Late::Gate().Enabled() && Late::Gate().Watch(waiting.gate.Get(), waiting.ready, waiting.serial) &&
         SUCCEEDED(queue->Wait(waiting.gate.Get(), waiting.ready)))
     {
         if (!Late::loggedCrossQueue)
