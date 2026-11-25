@@ -31,6 +31,7 @@
 #include "detours/detours.h"
 #include <ankerl/unordered_dense.h>
 #include <misc/IdentifyGpu.h>
+#include <nvapi/DrsCallerRule.h>
 
 static ankerl::unordered_dense::map<unsigned int, ContextData<IFeature_Dx12>> Dx12Contexts;
 static NgxFeatureRegistry HandleToFeature;
@@ -1011,7 +1012,27 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
     const bool isFG = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_FrameGeneration;
     const bool dlssgAdjacent = Nvngx_FG::isDx12Available() || State::Instance().activeFgInput == FGInput::DLSSG;
 
-    if (isUpscaling || (isFG && dlssgAdjacent))
+    // f5low's private Streamline (Frame Generator DLSS-G) asks here too: it unlocks its own nvngx_dlssg on RTX
+    // 20/30/40, so the driver's "not on this GPU" (0xBAD00012 on an RTX 2070 SUPER, Witcher 3, 2026-11-25) must not
+    // reach it. Only f5low's copy is told: the game's own Streamline keeps the driver's answer.
+    bool f5lowAsks = false;
+    if (isFG && !dlssgAdjacent)
+    {
+        HMODULE caller = nullptr;
+        wchar_t callerPath[MAX_PATH] {};
+        f5lowAsks =
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR) _ReturnAddress(), &caller) &&
+            GetModuleFileNameW(caller, callerPath, MAX_PATH) != 0 &&
+            drscaller::IsF5LowStreamline(std::filesystem::path(callerPath).filename().wstring());
+
+        static std::atomic<bool> logged { false };
+        if (f5lowAsks && !logged.exchange(true))
+            LOG_INFO("f5low's Streamline asked whether frame generation is supported: answered yes (f5low runs its "
+                     "own DLSS-G)");
+    }
+
+    if (isUpscaling || (isFG && (dlssgAdjacent || f5lowAsks)))
     {
         if (OutSupported == nullptr)
         {

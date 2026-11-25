@@ -4,8 +4,9 @@
 #include <string>
 #include <string_view>
 
-// Which driver-profile reads OptiScaler answers differently for one caller. Pure, host-tested in
-// tests/drs_caller_rule_smoke.cpp; NvApiHooks::hkNvAPI_DRS_GetSetting uses it.
+// Which driver-profile reads and NGX support checks OptiScaler answers differently for one caller. Pure, host-tested in
+// tests/drs_caller_rule_smoke.cpp; NvApiHooks::hkNvAPI_DRS_GetSetting and NVSDK_NGX_D3D12_GetFeatureRequirements use
+// it.
 namespace drscaller
 {
 // Streamline's "use the NVIDIA app's override plugins" switch (the NVIDIA app's DLSS override sets it to 1). With it
