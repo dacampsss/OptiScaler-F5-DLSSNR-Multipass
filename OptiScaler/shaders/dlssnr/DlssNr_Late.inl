@@ -72,12 +72,13 @@ CrossQueueGate::Watchdog& Gate()
     return *watchdog;
 }
 
-// [DlssNr] FinishedGpuWait: may this present queue a GPU wait on the game's render queue? Called once per present.
+// [DlssNr] FinishedGpuWait: may this present queue a GPU wait on the game's render queue? Called on every present
+// that reaches ApplyFinishedColor with Finished Picture on; `captured` = a capture of the game's frame is waiting.
 // Skyrim (v0.1.40-pre1 tester): the device was reset on the first frames of a DLSS-G context made again after the
 // upscaler was rebuilt, with the present waiting on the gate. Mode 2 keeps the wait off for a settle after frame
 // generation turns on/off/pauses or the upscaler changes; mode 3 keeps it off while OptiScaler's frame generation is
 // attached. Without the wait, frames still rendering at present are skipped, as before #362.
-bool GpuWaitAllowed()
+bool GpuWaitAllowed(bool captured)
 {
     const auto mode = Config::Instance()->DlssNrFinishedGpuWait.value_or_default();
     if (mode == 0)
@@ -91,18 +92,30 @@ bool GpuWaitAllowed()
     struct Seen
     {
         const void* fg = nullptr;
-        const void* upscaler = nullptr;
+        uint32_t upscaler = 0; // the upscaler object's serial, not its address (a rebuild can reuse the address)
         bool generating = false;
     };
     static Seen seen {};
     static uint32_t presentsSince = 0;
+    static uint32_t uncaptured = 0; // presents in a row with nothing captured (loading screen, upscaler gone)
+    static bool settleLogged = false;
     static std::chrono::steady_clock::time_point changedAt {};
-    const Seen now { fg, state.currentFeature, fg && fg->IsActive() && !fg->IsPaused() };
-    if (now.fg != seen.fg || now.upscaler != seen.upscaler || now.generating != seen.generating)
+    const Seen now { fg, state.currentFeature != nullptr ? state.currentFeature->CreatedSerial() : 0u,
+                     fg && fg->IsActive() && !fg->IsPaused() };
+    // A long stretch without captures counts as a change for as long as it lasts, so the settle starts when captures
+    // come back: frame generation and the upscaler can both be rebuilt inside it without this function seeing either
+    constexpr uint32_t kGapPresents = 30;
+    uncaptured = captured ? 0 : (uncaptured < UINT32_MAX ? uncaptured + 1 : uncaptured);
+    if (now.fg != seen.fg || now.upscaler != seen.upscaler || now.generating != seen.generating ||
+        uncaptured >= kGapPresents)
     {
-        if (presentsSince != 0 || seen.fg || seen.upscaler)
+        // Once per settle: a state that flips often keeps the wait off without a line each time
+        if (!settleLogged && (presentsSince != 0 || seen.fg || seen.upscaler))
+        {
+            settleLogged = true;
             LOG_INFO("DLSS-NR finished picture: frame generation or the upscaler changed; the present stops waiting "
                      "on the GPU for a moment (frames still rendering are skipped meanwhile)");
+        }
         seen = now;
         presentsSince = 0;
         changedAt = std::chrono::steady_clock::now();
@@ -111,7 +124,10 @@ bool GpuWaitAllowed()
         ++presentsSince;
     constexpr uint32_t kSettlePresents = 120;
     constexpr auto kSettleTime = std::chrono::seconds(2);
-    return presentsSince > kSettlePresents && std::chrono::steady_clock::now() - changedAt >= kSettleTime;
+    const bool settled = presentsSince > kSettlePresents && std::chrono::steady_clock::now() - changedAt >= kSettleTime;
+    if (settled)
+        settleLogged = false;
+    return settled;
 }
 
 // Slots whose gate the watchdog freed: their guide copy may still be pending and their fence now runs out of order, so
@@ -629,8 +645,11 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
     // Nothing captured from the game's own upscaler is waiting: leave the history alone. With native input the
     // picture is owned by ApplyNativeInput, and rejecting a swapchain format here (B8G8R8A8 in World of Warcraft)
     // would Cancel() and reset the shared history on every present.
-    if (std::none_of(Late::slots.begin(), Late::slots.end(),
-                     [](const auto& slot) { return slot.pending && slot.submitted; }))
+    const bool captured =
+        std::any_of(Late::slots.begin(), Late::slots.end(), [](const auto& slot) { return slot.pending && slot.submitted; });
+    // Before the early returns, so the settle sees every present, also those with nothing captured
+    const bool gpuWaitAllowed = Late::GpuWaitAllowed(captured);
+    if (!captured)
         return;
     Late::ComPtr<ID3D12Resource> color = picture;
     Late::ComPtr<ID3D12Device> currentDevice;
@@ -672,7 +691,6 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
     // The wait is watched before it is queued (a wait the watchdog could not watch is never queued), and queued before
     // anything is recorded: a later failure below leaves only a wait the gate's own signal ends.
     auto& waiting = Late::slots[index];
-    const bool gpuWaitAllowed = Late::GpuWaitAllowed(); // every present, so the settle counts presents
     if (pick == FinishedPick::NotReady && !inputs[index].sameQueue && inputs[index].completed != UINT64_MAX &&
         waiting.gated && gpuWaitAllowed && Late::Gate().Enabled() && Late::Gate().Watch(waiting.gate.Get(), waiting.ready, waiting.serial) &&
         SUCCEEDED(queue->Wait(waiting.gate.Get(), waiting.ready)))
