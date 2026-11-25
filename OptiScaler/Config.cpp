@@ -1141,6 +1141,7 @@ void Config::ReadDlssNr()
     DlssNrEnabled.set_from_config(readBool("DlssNr", "Enabled"));
     DlssNrRunBeforeSr.set_from_config(readBool("DlssNr", "RunBeforeSR"));
     DlssNrFinishedPicture.set_from_config(readBool("DlssNr", "FinishedPicture"));
+    DlssNrFinishedGpuWait.set_from_config(readUInt("DlssNr", "FinishedGpuWait"));
     DlssNrDeferredDlss.set_from_config(readBool("DlssNr", "DeferredDLSS"));
     DlssNrMultiViewScreens.set_from_config(readUInt("DlssNr", "MultiViewScreens"));
     DlssNrSecondaryFeatures.set_from_config(readUInt("DlssNr", "SecondaryFeatures"));
@@ -1476,6 +1477,7 @@ static void WriteDlssNr(Config& c, CSimpleIniA& out)
     // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) ---
     out.SetValue("DlssNr", "Enabled", GetBoolValue(c.DlssNrEnabled.value_for_config()).c_str());
     out.SetValue("DlssNr", "FinishedPicture", GetBoolValue(c.DlssNrFinishedPicture.value_for_config()).c_str());
+    out.SetValue("DlssNr", "FinishedGpuWait", GetIntValue(c.DlssNrFinishedGpuWait.value_for_config()).c_str());
     out.SetValue("DlssNr", "RunBeforeSR",
                  GetBoolValue(c.DlssNrRunBeforeSr.value_for_config()).c_str());
     out.SetValue("DlssNr", "DeferredDLSS",
