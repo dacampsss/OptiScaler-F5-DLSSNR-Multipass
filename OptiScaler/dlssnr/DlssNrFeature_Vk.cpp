@@ -16,6 +16,7 @@
 #include <dlssnr/DlssNr_Lut.h>
 #include <dlssnr/DlssNr_LutChain.h>
 #include <dlssnr/DlssNr_LutStatus.h>
+#include <dlssnr/DlssNr_LutCustom.h>
 #include <shaders/dlssnr/DlssNr_Guides.h>
 #include <shaders/dlssnr/DlssNr_GameScale.h>
 #include <shaders/dlssnr/DlssNr_TrimAnchors.h>
@@ -2232,18 +2233,28 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         encode.UseExposureWhitePoint = 0u;
     }
 
-    // The LUT-apply epic: grade the frame through a loaded .cube file before the model sees it. Placed after the
-    // Automatic meter above, which must keep reading the clean frame (a grade shifts apparent brightness by a
-    // content-dependent amount, so metering it made exposure drift on D3D12), and right before the encode, which is
-    // the only other reader of the game's colour ahead of the model. The encode writes `keep` from the same source it
-    // reads, so handing it the graded image makes `keep` carry the grade too, and the game's resource is never
-    // transitioned or written here -- only read, in the layout it arrived in. Skipped entirely without a LutFile.
+    // LUT-apply epic: grade the frame through a loaded .cube file or realtime custom LUT before the model sees it.
     VkImageView encodeSource = colour->Resource.ImageViewInfo.ImageView;
     VkImageLayout encodeSourceLayout = beforeSr ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
     {
-        const std::string lutPath = cfg.DlssNrLutFile.value_or_default();
+        const bool useCustom = cfg.DlssNrLutSource.value_or_default() == 1u;
+        DlssNr::CustomLutParams customParams {};
+        if (useCustom)
+        {
+            customParams.exposure = cfg.DlssNrLutExposure.value_or_default();
+            customParams.brightness = cfg.DlssNrLutBrightness.value_or_default();
+            customParams.gamma = cfg.DlssNrLutGamma.value_or_default();
+            customParams.blacks = cfg.DlssNrLutBlacks.value_or_default();
+            customParams.whites = cfg.DlssNrLutWhites.value_or_default();
+            customParams.contrast = cfg.DlssNrLutContrast.value_or_default();
+            customParams.temperature = cfg.DlssNrLutTemperature.value_or_default();
+            customParams.saturation = cfg.DlssNrLutSaturation.value_or_default();
+        }
+        const bool customNeutral = useCustom && DlssNr::IsNeutralCustomLut(customParams);
+        const std::string lutPath = useCustom ? std::string("<custom>") : cfg.DlssNrLutFile.value_or_default();
+        const bool lutWanted = useCustom ? !customNeutral : !lutPath.empty();
 
-        if (!lutPath.empty())
+        if (lutWanted)
         {
             const float lutStrength = std::clamp(cfg.DlssNrLutStrength.value_or_default(), 0.0f, 1.0f);
 
@@ -2264,15 +2275,16 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
             else
             {
                 bool graded = false;
-                DlssNr_LutEnsureParsed(&g_vk.lut, lutPath);
+                if (useCustom)
+                    DlssNr_LutEnsureCustom(&g_vk.lut, customParams);
+                else
+                    DlssNr_LutEnsureParsed(&g_vk.lut, lutPath);
 
                 if (g_vk.lut.Loaded())
                 {
                     if (!g_vk.lutPass)
                         g_vk.lutPass = std::make_unique<DlssNr_LutVk>(device, physicalDevice);
 
-                    // Replacing the 3D image (another file, or another size) while earlier frames still sample the
-                    // old one would free it under them; a rare, user-initiated change, so a drain is fine.
                     if (g_vk.lutPass->Ready() && g_vk.lutPass->NeedsDrainFor(g_vk.lut.lut.size, g_vk.lut.loadedPath))
                         vkDeviceWaitIdle(device);
 
@@ -2295,10 +2307,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
                         lutConstants.LatticeCoord = (uint32_t) g_vk.lut.lut.latticeCoord;
                         lutConstants.InputEncoding = shaderConversion;
                         lutConstants.ColourIsLinearHdr = linearHdr ? 1u : 0u;
-                        // The white point the encode below uses (Tune's pinned value included), so linear HDR lands
-                        // in the LUT's 0-1 domain where the model's proxy puts it; the Trim alone would leave a game
-                        // whose frame is scaled by its exposure far above white. With the encode's live fields and
-                        // image, so where the encode recomputes it this frame the LUT does too.
                         CopyLiveWhitePoint(lutConstants, encode);
                         if (liveExposureView == VK_NULL_HANDLE)
                             lutConstants.UseGameExposure = lutConstants.UseExposureWhitePoint = 0u;
@@ -2310,10 +2318,8 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
                 }
 
                 DlssNr::ReportLutStatus(true, g_vk.lut.loadedPath, g_vk.lut.lut.size, g_vk.lut.failed, g_vk.lut.error,
-                                        g_vk.lut.attemptedPath, lutStrength);
+                                        g_vk.lut.attemptedPath.empty() ? lutPath : g_vk.lut.attemptedPath, lutStrength);
 
-                // A file that did not parse, or a pass that did not build, leaves the frame ungraded -- never a failure
-                // of the whole pass.
                 if (graded)
                 {
                     encodeSource = g_vk.lutScratch.view;
@@ -2325,9 +2331,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         {
             if (g_vk.lutScratch.Valid() || (g_vk.lutPass && g_vk.lutPass->HoldsImage()))
             {
-                // LutFile was cleared: neither the scratch nor the 3D image (up to ~16 MB for a 128^3 lattice) is
-                // wanted by anything else. Earlier frames may still read them, so drain once; one hitch, and every
-                // later frame without a LutFile costs nothing.
                 vkDeviceWaitIdle(device);
                 DestroyImage(g_vk.lutScratch);
 
@@ -2336,6 +2339,7 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
             }
 
             g_vk.lutScratchFailed = false;
+            g_vk.lut = DlssNr_LutState();
             DlssNr::ReportLutStatus(false, "", 0, false, "", "", cfg.DlssNrLutStrength.value_or_default());
         }
     }

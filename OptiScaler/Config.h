@@ -463,6 +463,18 @@ class Config
     // How much of the LUT's grade reaches the image, 0..1. Default is fully graded once a LutFile is set.
     CustomOptional<float> DlssNrLutStrength { 1.0f };
 
+    // LUT source: 0 = LUT file, 1 = custom realtime adjustments. Custom adjustments generate a 3D LUT from sliders.
+    CustomOptional<uint32_t> DlssNrLutSource { 0u };
+    // Custom LUT adjustments. 0 is neutral for every control.
+    CustomOptional<float> DlssNrLutExposure { 0.0f };   // EV, -3..+3
+    CustomOptional<float> DlssNrLutBrightness { 0.0f }; // -1..+1
+    CustomOptional<float> DlssNrLutGamma { 0.0f };      // -1..+1, mapped to gamma curve
+    CustomOptional<float> DlssNrLutBlacks { 0.0f };     // -1..+1
+    CustomOptional<float> DlssNrLutWhites { 0.0f };     // -1..+1
+    CustomOptional<float> DlssNrLutContrast { 0.0f };   // -1..+1
+    CustomOptional<float> DlssNrLutTemperature { 0.0f }; // -1..+1, negative=cool, positive=warm
+    CustomOptional<float> DlssNrLutSaturation { 0.0f }; // -1..+1
+
     // Post-NR LUT stack (memory/plans/2026-10-31-nr-lut-chain.md): up to four .cube files graded onto the picture NR
     // returns, applied in order 1..4 with their own strength each. Unlike LutFile above the model never sees this
     // grade. Dense: an empty slot is an absent layer, and an all-empty stack is the feature not existing.
