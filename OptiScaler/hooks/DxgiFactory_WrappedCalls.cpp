@@ -451,9 +451,8 @@ HRESULT DxgiFactoryWrappedCalls::CreateSwapChain(IDXGIFactory* realFactory, Wrap
             WrappedIDXGISwapChain4* wrapped;
             if ((*ppSwapChain)->QueryInterface(IID_PPV_ARGS(&wrapped)) != S_OK)
             {
-                *ppSwapChain =
-                    new WrappedIDXGISwapChain4(realSC, realDevice, localDesc.OutputWindow, localDesc.Flags, false, false,
-                                           &hdrPlan);
+                *ppSwapChain = new WrappedIDXGISwapChain4(realSC, realDevice, localDesc.OutputWindow, localDesc.Flags,
+                                                          false, false, &hdrPlan, *ppSwapChain);
                 if (otherWindow)
                     static_cast<WrappedIDXGISwapChain4*>(*ppSwapChain)->MarkOtherWindow();
 
@@ -907,8 +906,8 @@ HRESULT DxgiFactoryWrappedCalls::CreateSwapChainForHwnd(IDXGIFactory2* realFacto
             WrappedIDXGISwapChain4* wrapped;
             if ((*ppSwapChain)->QueryInterface(IID_PPV_ARGS(&wrapped)) != S_OK)
             {
-                *ppSwapChain =
-                    new WrappedIDXGISwapChain4(realSC, readDevice, hWnd, localDesc.Flags, false, false, &hdrPlan);
+                *ppSwapChain = new WrappedIDXGISwapChain4(realSC, readDevice, hWnd, localDesc.Flags, false, false,
+                                                          &hdrPlan, *ppSwapChain);
                 if (otherWindow)
                     static_cast<WrappedIDXGISwapChain4*>(*ppSwapChain)->MarkOtherWindow();
 
@@ -996,11 +995,17 @@ HRESULT DxgiFactoryWrappedCalls::CreateSwapChainForCoreWindow(IDXGIFactory2* rea
     State::Instance().SCLastFlags = localDesc.Flags;
     State::Instance().realExclusiveFullscreen = false;
 
-    ID3D12CommandQueue* realQ = nullptr;
-    if (!Util::CheckForRealObject(__FUNCTION__, pDevice, (IUnknown**) &realQ))
-        realQ = (ID3D12CommandQueue*) pDevice;
+    ID3D12CommandQueue* cq = nullptr;
+    if (pDevice->QueryInterface(IID_PPV_ARGS(&cq)) == S_OK)
+    {
+        cq->Release();
 
-    State::Instance().currentCommandQueue = realQ;
+        ID3D12CommandQueue* realQ = nullptr;
+        if (!Util::CheckForRealObject(__FUNCTION__, cq, (IUnknown**) &realQ))
+            realQ = cq;
+
+        State::Instance().currentCommandQueue = realQ;
+    }
 
     {
         // HDR output: CoreWindow (UWP) swap chains are not supported; this logs the stand-down and the chain is not touched
@@ -1037,7 +1042,8 @@ HRESULT DxgiFactoryWrappedCalls::CreateSwapChainForCoreWindow(IDXGIFactory2* rea
         State::Instance().screenHeight = static_cast<float>(localDesc.Height);
 
         LOG_DEBUG("Created new swapchain: {0:X}, hWnd: {1:X}", (UINT64) *ppSwapChain, (UINT64) pWindow);
-        *ppSwapChain = new WrappedIDXGISwapChain4(realSC, readDevice, (HWND) pWindow, localDesc.Flags, true);
+        *ppSwapChain = new WrappedIDXGISwapChain4(realSC, readDevice, (HWND) pWindow, localDesc.Flags, true, false,
+                                                  nullptr, *ppSwapChain);
 
         if (!_skipFGSwapChainCreation)
             State::Instance().currentSwapchain = *ppSwapChain;

@@ -736,8 +736,10 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 }
 
 WrappedIDXGISwapChain4::WrappedIDXGISwapChain4(IDXGISwapChain* real, IUnknown* pDevice, HWND hWnd, UINT flags,
-                                               bool isUWP, bool isComposition, const SdrToHdr::Plan* plan)
-    : _real(real), _device(pDevice), _handle(hWnd), _refcount(1), _uwp(isUWP), _composition(isComposition)
+                                               bool isUWP, bool isComposition, const SdrToHdr::Plan* plan,
+                                               IUnknown* owner)
+    : _real(real), _owner(owner != nullptr ? owner : real), _device(pDevice), _handle(hWnd), _refcount(1), _uwp(isUWP),
+      _composition(isComposition)
 {
     _id = ++scCount;
     _lastFlags = flags;
@@ -1140,18 +1142,25 @@ ULONG STDMETHODCALLTYPE WrappedIDXGISwapChain4::Release()
         if (_libraryWindowed)
             FGHooks::ReleaseBorderless(this);
 
+        // Only the game's current swapchain takes frame generation down with it
+        const bool isCurrent =
+            State::Instance().currentSwapchain == this || State::Instance().currentWrappedSwapchain == this;
+
         if (!bridgeOwns && OwnsMenuCleanup())
             MenuOverlayDx::CleanupRenderTarget(true, _handle);
 
         if (State::Instance().currentSwapchain == this)
             State::Instance().currentSwapchain = nullptr;
 
-        if (State::Instance().currentRealSwapchain == this)
+        if (State::Instance().currentWrappedSwapchain == this)
+            State::Instance().currentWrappedSwapchain = nullptr;
+
+        if (State::Instance().currentRealSwapchain == _real)
             State::Instance().currentRealSwapchain = nullptr;
 
         // Not for a chain on another window (MarkOtherWindow): frame generation lives on its own window's chain
         auto fg = State::Instance().currentFG;
-        if (!bridgeOwns && !_otherWindow && fg != nullptr && fg->Mutex.getOwner() != 1 &&
+        if (!bridgeOwns && !_otherWindow && isCurrent && fg != nullptr && fg->Mutex.getOwner() != 1 &&
             fg->SwapchainContext() != nullptr)
         {
             fg->Deactivate();
@@ -1169,7 +1178,7 @@ ULONG STDMETHODCALLTYPE WrappedIDXGISwapChain4::Release()
         if (auto* proxy = Proxy())
             proxy->Release();
 
-        auto refCount = _real->Release();
+        auto refCount = _owner->Release();
 
         // After the release: the library can still present the chain until then
         if (_libraryChainMarked)
@@ -1195,7 +1204,7 @@ ULONG STDMETHODCALLTYPE WrappedIDXGISwapChain4::Release()
         }
         */
 
-        LOG_DEBUG("Real swapchain released, refCount: {}", refCount);
+        LOG_DEBUG("Owner released, refCount: {}", refCount);
 
         delete this;
     }

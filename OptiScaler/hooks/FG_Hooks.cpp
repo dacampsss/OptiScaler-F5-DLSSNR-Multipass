@@ -2119,6 +2119,9 @@ ULONG FGHooks::hkFGRelease(IUnknown* This)
             LOG_DEBUG("FG Swapchain released, clearing currentFGSwapchain");
             State::Instance().currentFGSwapchain = nullptr;
 
+            if (State::Instance().currentSwapchain == This)
+                State::Instance().currentSwapchain = nullptr;
+
             // currentWrappedSwapchain is the game's swapchain, held by the game: kept, as it is still alive
             if (!onlyOwnReferences && State::Instance().currentWrappedSwapchain != nullptr &&
                 State::Instance().currentSwapchainDesc.OutputWindow == _hwnd)
