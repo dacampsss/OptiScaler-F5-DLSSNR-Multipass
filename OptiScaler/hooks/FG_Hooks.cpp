@@ -42,6 +42,9 @@
 static ID3D12Fence* resizeFence = nullptr;
 static UINT64 resizeFenceValue = 0;
 static HANDLE resizeFenceEvent = nullptr;
+
+// Fence state is shared by every caller
+static std::mutex resizeFenceMutex;
 static IUnknown* oldSwapChain = nullptr;
 static ID3D12CommandQueue* currentCommandQueue = nullptr;
 static bool _forcedHdrForXeFG = false;
@@ -51,8 +54,14 @@ static HANDLE _semaphore = nullptr;
 inline static std::vector<void*> oldBackBuffers;
 #endif
 
-static bool WaitForQueueIdle(ID3D12CommandQueue* queue, ID3D12Fence* fence, HANDLE fenceEvent, UINT64& fenceValue)
+static bool WaitForQueueIdle(ID3D12CommandQueue* queue)
 {
+    std::scoped_lock lock(resizeFenceMutex);
+
+    auto fence = resizeFence;
+    auto fenceEvent = resizeFenceEvent;
+    auto& fenceValue = resizeFenceValue;
+
     if (queue == nullptr || fence == nullptr || fenceEvent == nullptr)
         return true;
 
@@ -162,8 +171,7 @@ static bool RefuseUnderGameFsrFg(HWND hwnd)
     {
         if (state.currentCommandQueue != nullptr && resizeFence != nullptr && resizeFenceEvent != nullptr)
         {
-            resizeFenceValue++;
-            WaitForQueueIdle(state.currentCommandQueue, resizeFence, resizeFenceEvent, resizeFenceValue);
+            WaitForQueueIdle(state.currentCommandQueue);
         }
 
         if (state.currentFG->ReleaseSwapchain(hwnd))
@@ -389,9 +397,7 @@ HRESULT FGHooks::CreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
             {
                 LOG_DEBUG("Waiting for GPU to finish");
 
-                resizeFenceValue++;
-                const auto waitResult = WaitForQueueIdle(State::Instance().currentCommandQueue, resizeFence,
-                                                         resizeFenceEvent, resizeFenceValue);
+                const auto waitResult = WaitForQueueIdle(State::Instance().currentCommandQueue);
 
                 LOG_DEBUG("WaitForSingleObject result: {}", waitResult);
             }
@@ -413,6 +419,8 @@ HRESULT FGHooks::CreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
     {
         if (State::Instance().currentD3D12Device != nullptr)
         {
+            std::scoped_lock lock(resizeFenceMutex);
+
             SAFE_RELEASE(resizeFence);
             SAFE_CLOSE_HANDLE(resizeFenceEvent);
 
@@ -503,9 +511,7 @@ HRESULT FGHooks::CreateSwapChainForHwnd(IDXGIFactory* pFactory, IUnknown* pDevic
             {
                 LOG_DEBUG("Waiting for GPU to finish");
 
-                resizeFenceValue++;
-                const auto waitResult = WaitForQueueIdle(State::Instance().currentCommandQueue, resizeFence,
-                                                         resizeFenceEvent, resizeFenceValue);
+                const auto waitResult = WaitForQueueIdle(State::Instance().currentCommandQueue);
 
                 LOG_DEBUG("WaitForSingleObject result: {}", waitResult);
             }
@@ -527,6 +533,8 @@ HRESULT FGHooks::CreateSwapChainForHwnd(IDXGIFactory* pFactory, IUnknown* pDevic
     {
         if (State::Instance().currentD3D12Device != nullptr)
         {
+            std::scoped_lock lock(resizeFenceMutex);
+
             SAFE_RELEASE(resizeFence);
             SAFE_CLOSE_HANDLE(resizeFenceEvent);
 
@@ -549,6 +557,12 @@ void FGHooks::SetFGSwapchain(IDXGISwapChain* pSwapChain, HWND hWnd)
         return;
 
     _hwnd = hWnd;
+
+    // Requested by the swapchain being created (not by another window's), applied now that it is the FG swapchain.
+    // The HDR output's own keep (KeepBorderless) stays as it is.
+    if (!_hdrKeeper.Active())
+        State::Instance().SCExclusiveFullscreen =
+            BorderlessForced() && State::Instance().SCExclusiveFullscreenRequested;
 
     if (_dx12InteropPresentSC == pSwapChain)
     {
@@ -732,17 +746,10 @@ HRESULT FGHooks::hkSetFullscreenState(IDXGISwapChain* This, BOOL Fullscreen, IDX
         {
             Fullscreen = false;
 
-            if (!State::Instance().SCExclusiveFullscreen)
-            {
-                State::Instance().SCExclusiveFullscreen = true;
-                modeChanged = true;
-            }
-            else if (_hdrKeeper.Active())
-            {
-                // HDR output already keeps it borderless; the game asking again restyles the window once more (it may
-                // have been restyled by the game in between)
-                modeChanged = true;
-            }
+            // Also when created in emulated fullscreen (or kept by HDR output), the window may not cover the screen
+            // yet or the game may have restyled it since; the restyle is a no-op when the window already matches
+            State::Instance().SCExclusiveFullscreen = true;
+            modeChanged = true;
 
             LOG_DEBUG("Prevented exclusive fullscreen");
         }
@@ -1023,7 +1030,12 @@ HRESULT FGHooks::hkGetFullscreenState(IDXGISwapChain* This, BOOL* pFullscreen, I
 
     if (result == S_OK && State::Instance().SCExclusiveFullscreen && BorderlessForced())
     {
-        *pFullscreen = true;
+        if (pFullscreen != nullptr)
+            *pFullscreen = true;
+
+        // Exclusive fullscreen reports its output, games use it
+        if (ppTarget != nullptr && *ppTarget == nullptr)
+            This->GetContainingOutput(ppTarget);
     }
 
     return result;
@@ -1054,9 +1066,7 @@ HRESULT FGHooks::hkResizeBuffers(IDXGISwapChain* This, UINT BufferCount, UINT Wi
     {
         LOG_DEBUG("Waiting for GPU to finish before resizing buffers");
 
-        resizeFenceValue++;
-        const auto waitResult =
-            WaitForQueueIdle(State::Instance().currentCommandQueue, resizeFence, resizeFenceEvent, resizeFenceValue);
+        const auto waitResult = WaitForQueueIdle(State::Instance().currentCommandQueue);
 
         LOG_DEBUG("WaitForSingleObject result: {}", waitResult);
     }
@@ -1325,9 +1335,7 @@ HRESULT FGHooks::hkResizeBuffers1(IDXGISwapChain3* This, UINT BufferCount, UINT 
     {
         LOG_DEBUG("Waiting for GPU to finish before resizing buffers");
 
-        resizeFenceValue++;
-        const auto waitResult =
-            WaitForQueueIdle(State::Instance().currentCommandQueue, resizeFence, resizeFenceEvent, resizeFenceValue);
+        const auto waitResult = WaitForQueueIdle(State::Instance().currentCommandQueue);
 
         LOG_DEBUG("WaitForSingleObject result: {}", waitResult);
     }
@@ -2059,9 +2067,7 @@ ULONG FGHooks::hkFGRelease(IUnknown* This)
             {
                 LOG_DEBUG("Waiting for GPU to finish");
 
-                resizeFenceValue++;
-                const auto waitResult = WaitForQueueIdle(State::Instance().currentCommandQueue, resizeFence,
-                                                         resizeFenceEvent, resizeFenceValue);
+                const auto waitResult = WaitForQueueIdle(State::Instance().currentCommandQueue);
 
                 LOG_DEBUG("WaitForSingleObject result: {}", waitResult);
             }
@@ -2118,6 +2124,10 @@ ULONG FGHooks::hkFGRelease(IUnknown* This)
 
             LOG_DEBUG("FG Swapchain released, clearing currentFGSwapchain");
             State::Instance().currentFGSwapchain = nullptr;
+
+            // The emulated full screen went with it (HDR output's own keep is released by its owner)
+            if (!_hdrKeeper.Active())
+                State::Instance().SCExclusiveFullscreen = false;
 
             if (State::Instance().currentSwapchain == This)
                 State::Instance().currentSwapchain = nullptr;

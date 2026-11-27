@@ -962,6 +962,8 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
     auto frame = _frameCount % VKDX12_BUFFER_COUNT;
     LOG_DEBUG("frame: {}", frame);
 
+    registeredVirtualCommandBuffer = VK_NULL_HANDLE;
+
     auto commandBufferLevel = Vulkan_wDx12::cmdBufferStateTracker.GetCommandBufferLevel(InCmdList);
     if (!commandBufferLevel.has_value())
     {
@@ -1013,15 +1015,44 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
 
     // Only wait if we're more than 1 frame behind (triple buffering protection)
     uint64_t lastFrameToWaitFor = (_frameCount > 1) ? (_frameCount - 1) : 0;
+    bool waitAborted = false;
     if (Dx12Fence->GetCompletedValue() < lastFrameToWaitFor)
     {
         // Only wait for N-1 frame, not current frame
         Dx12Fence->SetEventOnCompletion(lastFrameToWaitFor, Dx12FenceEvent);
-        WaitForSingleObject(Dx12FenceEvent, INFINITE);
+        if (WaitForSingleObject(Dx12FenceEvent, 1000) != WAIT_OBJECT_0)
+        {
+            // Its command buffer wasn't submitted, D3D12 is still waiting for it
+            size_t aborted = 0;
+            for (auto fence : dx12FenceTextureCopy)
+                aborted += Vulkan_wDx12::AbortPendingSubmissions(fence);
+
+            LOG_WARN("Previous upscale didn't complete, aborted {} pending submits", aborted);
+            waitAborted = aborted > 0;
+
+            // Engine records the next upscale before submitting the previous one, every frame would stall
+            // Nothing to abort means GPU is just slow (shader compiles etc.)
+            if ((waitAborted && ++_abortedWaits >= 3) ||
+                WaitForSingleObject(Dx12FenceEvent, waitAborted ? 1000 : INFINITE) != WAIT_OBJECT_0)
+            {
+                LOG_ERROR("Previous upscale is stuck, changing upscaler");
+                State::Instance().changeBackend[Handle()->Id] = true;
+                return false;
+            }
+        }
     }
 
-    Dx12CommandAllocator[frame]->Reset();
-    Dx12CommandList[frame]->Reset(Dx12CommandAllocator[frame], nullptr);
+    if (!waitAborted)
+        _abortedWaits = 0;
+
+    if (Dx12CommandAllocator[frame]->Reset() != S_OK ||
+        Dx12CommandList[frame]->Reset(Dx12CommandAllocator[frame], nullptr) != S_OK)
+    {
+        LOG_ERROR("Can't reset D3D12 command list");
+        return false;
+    }
+
+    commandListOpen = true;
 
 #pragma region Extract Vulkan Resources
 
@@ -1295,6 +1326,9 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
 
         auto& b = VulkanQueueCommandBuffers[ActiveQueueFamilyIndex];
 
+        // An aborted upscale from two frames ago can still use it
+        Vulkan_wDx12::DropPendingSubmissions(b.VulkanBarrierCommandBuffer[frame]);
+
         auto vkResult = vkResetCommandBuffer(b.VulkanBarrierCommandBuffer[frame], 0);
         if (vkResult != VK_SUCCESS)
         {
@@ -1319,6 +1353,8 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
             vkEndCommandBuffer(b.VulkanBarrierCommandBuffer[frame]);
             return false;
         }
+
+        registeredVirtualCommandBuffer = b.VulkanBarrierCommandBuffer[frame];
 
         vk_state::ReplayParams params {};
         params.ReplayGraphicsPipeline = true;
@@ -1637,6 +1673,7 @@ bool IFeature_VkwDx12::CopyBackOutput(VkCommandBuffer InCmdBuffer)
     }
 
     HRESULT result = Dx12CommandList[frame]->Close();
+    commandListOpen = false;
     if (result != S_OK)
     {
         LOG_ERROR("Dx12CommandList->Close failed: {0:x}", result);
@@ -1717,23 +1754,45 @@ bool IFeature_VkwDx12::CopyBackOutput(VkCommandBuffer InCmdBuffer)
 
 void IFeature_VkwDx12::AbortPendingInterop(VkCommandBuffer InCmdBuffer, uint32_t InFrame)
 {
-    Vulkan_wDx12::CancelPendingSubmission(InCmdBuffer);
-
-    // ProcessVulkanTextures resets the command list before validation/copy setup. Close it on every aborted Evaluate so
-    // the same command-list slot can be Reset safely on the next frame. No D3D12 queue wait is queued before success.
-    if (Dx12CommandList[InFrame] != nullptr)
+    // Left open when Evaluate failed between ProcessVulkanTextures and CopyBackOutput. No D3D12 queue wait is queued
+    // before success.
+    if (commandListOpen && Dx12CommandList[InFrame] != nullptr)
         Dx12CommandList[InFrame]->Close();
 
-    auto virtualCommandBuffer = Vulkan_wDx12::RemoveVirtualCommandBuffer(InCmdBuffer);
-    if (virtualCommandBuffer != VK_NULL_HANDLE)
-        Vulkan_wDx12::EndCmdBuffer(virtualCommandBuffer);
+    commandListOpen = false;
+
+    // Another Evaluate on the same command buffer can own the mapping, CopyBackOutput cancels its own submission
+    if (registeredVirtualCommandBuffer != VK_NULL_HANDLE &&
+        Vulkan_wDx12::RemoveVirtualCommandBuffer(InCmdBuffer) == registeredVirtualCommandBuffer)
+    {
+        Vulkan_wDx12::EndCmdBuffer(registeredVirtualCommandBuffer);
+    }
+
+    registeredVirtualCommandBuffer = VK_NULL_HANDLE;
 
     pendingResourceCopyValue = 0;
+}
+
+void IFeature_VkwDx12::FinishPendingWork()
+{
+    for (auto fence : dx12FenceTextureCopy)
+        Vulkan_wDx12::AbortPendingSubmissions(fence);
+
+    // Aborted upscales start running on D3D12 now
+    if (Dx12CommandQueue != nullptr && Dx12Fence != nullptr && Dx12FenceEvent != nullptr &&
+        Dx12CommandQueue->Signal(Dx12Fence, _frameCount + 1) == S_OK &&
+        Dx12Fence->SetEventOnCompletion(_frameCount + 1, Dx12FenceEvent) == S_OK)
+    {
+        WaitForSingleObject(Dx12FenceEvent, 1000);
+    }
 }
 
 void IFeature_VkwDx12::ReleaseSharedResources()
 {
     LOG_FUNC();
+
+    // The objects released below and the D3D12 upscaler destroyed after this can still be in use until then
+    FinishPendingWork();
 
     // Release Vulkan resources
     SAFE_DESTROY_VK(vkDestroyImage, VulkanDevice, vkColor.VkSharedImage, nullptr);
@@ -1779,6 +1838,10 @@ void IFeature_VkwDx12::ReleaseSharedResources()
     {
         for (size_t i = 0; i < VKDX12_BUFFER_COUNT; i++)
         {
+            // Game can still submit an aborted upscale, its barrier command buffer is freed with the pool
+            if (b.VulkanBarrierCommandBuffer[i] != VK_NULL_HANDLE)
+                Vulkan_wDx12::DropPendingSubmissions(b.VulkanBarrierCommandBuffer[i]);
+
             if (b.VulkanBarrierCommandBuffer[i] != VK_NULL_HANDLE && b.VulkanBarrierCommandPool[i] != VK_NULL_HANDLE)
             {
                 vkFreeCommandBuffers(VulkanDevice, b.VulkanBarrierCommandPool[i], 1, &b.VulkanBarrierCommandBuffer[i]);
@@ -1874,8 +1937,8 @@ HRESULT IFeature_VkwDx12::CreateDx12Device()
     {
         _dx11on12Device = _bridgeDevice;
     }
-    else if (State::Instance().currentD3D12Device == nullptr ||
-             ((State::Instance().gameQuirks & GameQuirk::ForceCreateD3D12Device) && _localDx11on12Device == nullptr))
+    else if (_localDx11on12Device == nullptr && (State::Instance().currentD3D12Device == nullptr ||
+                                                 (State::Instance().gameQuirks & GameQuirk::ForceCreateD3D12Device)))
     {
         IDXGIFactory2* factory = nullptr;
 
@@ -2321,8 +2384,8 @@ bool IFeature_VkwDx12::CreateSharedFenceSemaphore()
 {
     LOG_FUNC();
 
-    // If already created, just return success
-    if (dx12FenceTextureCopy[0] != nullptr && vkSemaphoreTextureCopy[0] != VK_NULL_HANDLE)
+    // Created in order, the last one exists only when all do
+    if (vkSemaphoreCopyBack[VKDX12_BUFFER_COUNT - 1] != VK_NULL_HANDLE)
     {
         return true;
     }
@@ -2387,6 +2450,7 @@ bool IFeature_VkwDx12::CreateSharedFenceSemaphore()
             if (vkImportSemaphoreWin32HandleKHR(VulkanDevice, &importSemaphoreInfo) != VK_SUCCESS)
             {
                 LOG_ERROR("Failed to import semaphore Win32 handle");
+                SAFE_DESTROY_VK(vkDestroySemaphore, VulkanDevice, vkSemaphoreTextureCopy[i], nullptr);
                 return false;
             }
 

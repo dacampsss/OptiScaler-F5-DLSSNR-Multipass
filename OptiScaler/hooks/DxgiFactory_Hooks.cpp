@@ -576,11 +576,10 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
 
     if (UsesXeFGApi(State::Instance().activeFgOutput) && FGHooks::BorderlessForced())
     {
-        if (!localDesc.Windowed)
-        {
-            State::Instance().SCExclusiveFullscreen = true;
-            localDesc.Windowed = true;
-        }
+        // Nested call from the FG library is windowed, keep the outer request
+        if (!_skipFGSwapChainCreation)
+            State::Instance().SCExclusiveFullscreenRequested = !localDesc.Windowed;
+        localDesc.Windowed = true;
 
         localDesc.Flags &= ~DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
         localDesc.BufferDesc.Scaling = DXGI_MODE_SCALING_STRETCHED;
@@ -1032,12 +1031,11 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
 
     if (UsesXeFGApi(State::Instance().activeFgOutput) && FGHooks::BorderlessForced())
     {
-        if (pFullscreenDesc != nullptr && !localFullscreenDesc.Windowed)
-        {
-
-            State::Instance().SCExclusiveFullscreen = true;
-            localFullscreenDesc.Windowed = true;
-        }
+        // Nested call from the FG library is windowed, keep the outer request
+        if (!_skipFGSwapChainCreation)
+            State::Instance().SCExclusiveFullscreenRequested =
+                pFullscreenDesc != nullptr && !localFullscreenDesc.Windowed;
+        localFullscreenDesc.Windowed = true;
 
         localDesc.Flags &= ~DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
         localDesc.Scaling = DXGI_SCALING_STRETCH;
@@ -1672,11 +1670,10 @@ HRESULT DxgiFactoryHooks::DLSSGCreateSwapChain(IDXGIFactory* realFactory, IUnkno
 
     if (UsesXeFGApi(State::Instance().activeFgOutput) && FGHooks::BorderlessForced())
     {
-        if (!localDesc.Windowed)
-        {
-            State::Instance().SCExclusiveFullscreen = true;
-            localDesc.Windowed = true;
-        }
+        // Nested call from the FG library is windowed, keep the outer request
+        if (!_skipFGSwapChainCreation)
+            State::Instance().SCExclusiveFullscreenRequested = !localDesc.Windowed;
+        localDesc.Windowed = true;
 
         localDesc.Flags &= ~DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
         localDesc.BufferDesc.Scaling = DXGI_MODE_SCALING_STRETCHED;
@@ -1997,12 +1994,11 @@ HRESULT DxgiFactoryHooks::DLSSGCreateSwapChainForHwnd(IDXGIFactory2* realFactory
 
     if (UsesXeFGApi(State::Instance().activeFgOutput) && FGHooks::BorderlessForced())
     {
-        if (pFullscreenDesc != nullptr && !localFullscreenDesc.Windowed)
-        {
-
-            State::Instance().SCExclusiveFullscreen = true;
-            localFullscreenDesc.Windowed = true;
-        }
+        // Nested call from the FG library is windowed, keep the outer request
+        if (!_skipFGSwapChainCreation)
+            State::Instance().SCExclusiveFullscreenRequested =
+                pFullscreenDesc != nullptr && !localFullscreenDesc.Windowed;
+        localFullscreenDesc.Windowed = true;
 
         localDesc.Flags &= ~DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
         localDesc.Scaling = DXGI_SCALING_STRETCH;
@@ -2324,8 +2320,8 @@ HRESULT DxgiFactoryHooks::DLSSGCreateSwapChainForCoreWindow(IDXGIFactory2* realF
     HRESULT result = E_FAIL;
     {
         ScopedSkipDxgiLoadChecks skipDxgiLoadChecks {};
-        auto result = o_DLSSGCreateSwapChainForCoreWindow(realFactory, pDevice, pWindow, &localDesc, pRestrictToOutput,
-                                                          ppSwapChain);
+        result = o_DLSSGCreateSwapChainForCoreWindow(realFactory, pDevice, pWindow, &localDesc, pRestrictToOutput,
+                                                     ppSwapChain);
     }
 
     if (SwapchainCreate::Created(result, ppSwapChain))
