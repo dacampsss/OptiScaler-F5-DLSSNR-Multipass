@@ -13,6 +13,7 @@
 #include <hooks/Streamline_Hooks.h>
 #include <native/NativeLowLatency.h>
 #include <hooks/DxgiFactory_Hooks.h>
+#include <misc/DeferredRelease.h>
 
 #include <magic_enum.hpp>
 
@@ -665,11 +666,11 @@ void DLSSG_Dx12::ReleaseObjects()
     for (size_t i = 0; i < BUFFER_COUNT; i++)
     {
         // The GPU can still be executing them
-        Util::DelayedReleaseClear(_uiCommandAllocator[i]);
-        Util::DelayedReleaseClear(_uiCommandList[i]);
-        Util::DelayedReleaseClear(_scCommandAllocator[i]);
-        Util::DelayedReleaseClear(_scCommandList[i]);
-        Util::DelayedReleaseClear(dlssgFence[i]);
+        DeferredRelease::Release(_uiCommandAllocator[i]);
+        DeferredRelease::Release(_uiCommandList[i]);
+        DeferredRelease::Release(_scCommandAllocator[i]);
+        DeferredRelease::Release(_scCommandList[i]);
+        DeferredRelease::Release(dlssgFence[i]);
 
         // Reset command list state
         _scCommandListResetted[i] = false;

@@ -100,18 +100,18 @@ void IFeature_Dx11wDx12::ReleaseSharedResources()
 
     for (size_t i = 0; i < DX11WDX12_COMMAND_BUFFER_COUNT; i++)
     {
-        Util::DelayedReleaseClear(Dx12CommandList[i]);
-        Util::DelayedReleaseClear(Dx12CommandAllocator[i]);
+        DeferredRelease::Release(Dx12CommandList[i]);
+        DeferredRelease::Release(Dx12CommandAllocator[i]);
         Dx12CommandAllocatorFenceValue[i] = 0;
     }
 
-    Util::DelayedReleaseClear(Dx12Fence);
+    DeferredRelease::Release(Dx12Fence);
     Dx12FenceValue = 0;
 
     // The fence can still signal it if the wait above timed out
     if (Dx12FenceEvent)
     {
-        Util::DelayedRun([event = Dx12FenceEvent]() { CloseHandle(event); });
+        DeferredRelease::Enqueue([event = Dx12FenceEvent]() { CloseHandle(event); });
         Dx12FenceEvent = nullptr;
     }
 

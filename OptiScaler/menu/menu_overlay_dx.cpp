@@ -5,6 +5,7 @@
 #include <Util.h>
 #include <Logger.h>
 #include <Config.h>
+#include <misc/DeferredRelease.h>
 #include <resource_tracking/GenericDepth_Dx12.h>
 #include <dlssnr/DlssNr_ExposureScan_Dx11.h>
 #include <resource_tracking/GenericDepth_Dx11.h>
@@ -222,15 +223,16 @@ static void CleanupRenderTargetDx12(bool clearQueue)
             ImGui_ImplDX12_Shutdown(false);
         }
 
-        SAFE_RELEASE(g_pd3dRtvDescHeap);
-        SAFE_RELEASE(g_pd3dSrvDescHeap);
+        // The wait above can time out
+        DeferredRelease::Release(g_pd3dRtvDescHeap);
+        DeferredRelease::Release(g_pd3dSrvDescHeap);
 
         for (UINT i = 0; i < NUM_BACK_BUFFERS; ++i)
         {
-            SAFE_RELEASE(g_commandAllocators[i]);
+            DeferredRelease::Release(g_commandAllocators[i]);
         }
 
-        SAFE_RELEASE(g_pd3dCommandList);
+        DeferredRelease::Release(g_pd3dCommandList);
 
         if (g_pd3dCommandQueue != nullptr)
             g_pd3dCommandQueue = nullptr;

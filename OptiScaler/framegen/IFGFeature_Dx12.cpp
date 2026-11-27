@@ -479,19 +479,19 @@ void IFGFeature_Dx12::DestroyCopyCmdList()
     // The GPU can still be executing them
     for (size_t i = 0; i < BUFFER_COUNT; i++)
     {
-        Util::DelayedReleaseClear(_copyCommandAllocator[i]);
-        Util::DelayedReleaseClear(_copyCommandList[i]);
+        DeferredRelease::Release(_copyCommandAllocator[i]);
+        DeferredRelease::Release(_copyCommandList[i]);
     }
 }
 
 void IFGFeature_Dx12::ReleaseUIFence()
 {
     // Recreated with the objects, so it is never signaled from another device's queue
-    Util::DelayedReleaseClear(_uiFence);
+    DeferredRelease::Release(_uiFence);
 
     if (_uiFenceEvent != nullptr)
     {
-        Util::DelayedRun([event = _uiFenceEvent]() { CloseHandle(event); });
+        DeferredRelease::Enqueue([event = _uiFenceEvent]() { CloseHandle(event); });
         _uiFenceEvent = nullptr;
     }
 

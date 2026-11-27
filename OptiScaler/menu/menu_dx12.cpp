@@ -5,6 +5,7 @@
 
 #include "Config.h"
 #include "menu_common.h"
+#include <misc/DeferredRelease.h>
 #include <imgui/imgui_impl_dx12.h>
 #include <imgui/imgui_impl_win32.h>
 
@@ -255,10 +256,10 @@ Menu_Dx12::~Menu_Dx12()
     MenuCommon::Shutdown();
 
     // The last menu render can still be running
-    Util::DelayedReleaseClear(_rtvDescHeap);
-    Util::DelayedReleaseClear(_srvDescHeap);
-    Util::DelayedReleaseClear(_renderTargetResource[0]);
-    Util::DelayedReleaseClear(_renderTargetResource[1]);
+    DeferredRelease::Release(_rtvDescHeap);
+    DeferredRelease::Release(_srvDescHeap);
+    DeferredRelease::Release(_renderTargetResource[0]);
+    DeferredRelease::Release(_renderTargetResource[1]);
 }
 
 void Menu_Dx12::CreateRenderTarget(const D3D12_RESOURCE_DESC& InDesc)
@@ -273,10 +274,8 @@ void Menu_Dx12::CreateRenderTarget(const D3D12_RESOURCE_DESC& InDesc)
             TranslateTypelessFormats(InDesc.Format) != rtDesc.Format)
         {
             // Last frames' copies may still be on the GPU
-            Util::DelayedRelease(_renderTargetResource[0]);
-            Util::DelayedRelease(_renderTargetResource[1]);
-            _renderTargetResource[0] = nullptr;
-            _renderTargetResource[1] = nullptr;
+            DeferredRelease::Release(_renderTargetResource[0]);
+            DeferredRelease::Release(_renderTargetResource[1]);
         }
         else
             return;

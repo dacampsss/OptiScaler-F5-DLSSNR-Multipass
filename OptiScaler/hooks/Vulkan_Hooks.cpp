@@ -1980,6 +1980,10 @@ static void hkvkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAll
     if (device != VK_NULL_HANDLE && _device == device)
         _device = VK_NULL_HANDLE;
 
+    // What is still waiting for its frames goes now, the device is idle and everything above that enqueues is done
+    if (device != VK_NULL_HANDLE)
+        DeferredRelease::ReleaseOwner((uint64_t) device);
+
     if (o_vkDestroyDevice != nullptr)
         o_vkDestroyDevice(device, pAllocator);
 

@@ -2,7 +2,6 @@
 #include "SysUtils.h"
 
 #include <filesystem>
-#include <functional>
 
 #include <dxgi1_6.h>
 #include <d3d11.h>
@@ -88,36 +87,6 @@ inline void DelayedRelease(IUnknown* object)
 {
     if (object != nullptr)
         DelayedDestroy(std::make_unique<ReleaseLater>(object));
-}
-
-// DelayedRelease for an owner's pointer: the pointer is cleared, the object is released later
-template <typename T> void DelayedReleaseClear(T*& object)
-{
-    if (object == nullptr)
-        return;
-
-    DelayedRelease(object);
-    object = nullptr;
-}
-
-// Runs a cleanup (closing a handle, say) by the same delay
-struct RunLater
-{
-    explicit RunLater(std::function<void()> run) : run(std::move(run)) {}
-    ~RunLater()
-    {
-        if (run)
-            run();
-    }
-    RunLater(const RunLater&) = delete;
-    RunLater& operator=(const RunLater&) = delete;
-    std::function<void()> run;
-};
-
-inline void DelayedRun(std::function<void()> run)
-{
-    if (run)
-        DelayedDestroy(std::make_unique<RunLater>(std::move(run)));
 }
 
 }; // namespace Util

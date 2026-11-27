@@ -3,6 +3,8 @@
 #include "dx11_with_dx12.h"
 #include "with_dx12.h"
 
+#include <misc/DeferredRelease.h>
+
 #define ASSIGN_DESC(dest, src)                                                                                         \
     dest.Width = src.Width;                                                                                            \
     dest.Height = src.Height;                                                                                          \
@@ -83,7 +85,7 @@ void Dx11WithDx12::ReleaseSharedResource(D3D11_TEXTURE2D_RESOURCE_C* resource)
         return;
 
     // D3D12 queue can still be using it
-    Util::DelayedReleaseClear(resource->Dx12Resource);
+    DeferredRelease::Release(resource->Dx12Resource);
 
     if (resource->Dx11Handle != NULL && resource->UsesNTHandle)
         CloseHandle(resource->Dx11Handle);

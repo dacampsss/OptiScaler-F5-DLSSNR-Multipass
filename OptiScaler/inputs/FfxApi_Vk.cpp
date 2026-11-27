@@ -14,6 +14,8 @@
 
 #include <nvsdk_ngx_vk.h>
 #include <nvsdk_ngx_helpers_vk.h>
+#include <misc/DeferredRelease.h>
+#include <array>
 
 static std::unordered_map<ffxContext, ffxCreateContextDescUpscale> _initParams;
 static std::unordered_map<ffxContext, NVSDK_NGX_Parameter*> _nvParams;
@@ -723,31 +725,22 @@ ffxReturnCode_t ffxDispatch_Vk(ffxContext* context, ffxDispatchDescHeader* desc)
 
     // Clear last frames image views
     LOG_DEBUG("Clear last frames image views");
-    if (depthImageView != nullptr)
-        vkDestroyImageView(_vkDevice, depthImageView, nullptr);
+    // The GPU can still be using them
+    std::array<VkImageView, 8> lastViews { depthImageView, expImageView,    biasImageView,   colorImageView,
+                                           mvImageView,    outputImageView, fsrReactiveView, fsrTransparencyView };
 
-    if (expImageView != nullptr)
-        vkDestroyImageView(_vkDevice, expImageView, nullptr);
+    DeferredRelease::Enqueue(
+        [device = _vkDevice, lastViews]()
+        {
+            for (auto view : lastViews)
+            {
+                if (view != VK_NULL_HANDLE)
+                    vkDestroyImageView(device, view, nullptr);
+            }
+        },
+        (uint64_t) _vkDevice);
 
-    if (biasImageView != nullptr)
-        vkDestroyImageView(_vkDevice, biasImageView, nullptr);
-
-    if (colorImageView != nullptr)
-        vkDestroyImageView(_vkDevice, colorImageView, nullptr);
-
-    if (mvImageView != nullptr)
-        vkDestroyImageView(_vkDevice, mvImageView, nullptr);
-
-    if (outputImageView != nullptr)
-        vkDestroyImageView(_vkDevice, outputImageView, nullptr);
-
-    if (fsrReactiveView != nullptr)
-        vkDestroyImageView(_vkDevice, fsrReactiveView, nullptr);
-
-    if (fsrTransparencyView != nullptr)
-        vkDestroyImageView(_vkDevice, fsrTransparencyView, nullptr);
-
-    // Destroyed above: a view that isn't made again this frame must not be destroyed twice next frame
+    // Handed to the queue above: a view that isn't made again this frame must not be destroyed twice next frame
     depthImageView = VK_NULL_HANDLE;
     expImageView = VK_NULL_HANDLE;
     biasImageView = VK_NULL_HANDLE;

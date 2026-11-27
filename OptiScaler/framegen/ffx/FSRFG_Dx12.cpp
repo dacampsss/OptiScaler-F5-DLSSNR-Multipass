@@ -1414,12 +1414,12 @@ void FSRFG_Dx12::ReleaseObjects()
     for (size_t i = 0; i < BUFFER_COUNT; i++)
     {
         // The GPU can still be executing them
-        Util::DelayedReleaseClear(_fgCommandAllocator[i]);
-        Util::DelayedReleaseClear(_fgCommandList[i]);
-        Util::DelayedReleaseClear(_uiCommandAllocator[i]);
-        Util::DelayedReleaseClear(_uiCommandList[i]);
-        Util::DelayedReleaseClear(_scCommandAllocator[i]);
-        Util::DelayedReleaseClear(_scCommandList[i]);
+        DeferredRelease::Release(_fgCommandAllocator[i]);
+        DeferredRelease::Release(_fgCommandList[i]);
+        DeferredRelease::Release(_uiCommandAllocator[i]);
+        DeferredRelease::Release(_uiCommandList[i]);
+        DeferredRelease::Release(_scCommandAllocator[i]);
+        DeferredRelease::Release(_scCommandList[i]);
 
         // Reset command list state
         _scCommandListResetted[i] = false;

@@ -1805,43 +1805,13 @@ void IFeature_VkwDx12::ReleaseSharedResources()
     // The objects released below and the D3D12 upscaler destroyed after this can still be in use until then
     FinishPendingWork();
 
-    // Release Vulkan resources
-    SAFE_DESTROY_VK(vkDestroyImage, VulkanDevice, vkColor.VkSharedImage, nullptr);
-    SAFE_DESTROY_VK(vkDestroyImage, VulkanDevice, vkMv.VkSharedImage, nullptr);
-    SAFE_DESTROY_VK(vkDestroyImage, VulkanDevice, vkOut.VkSharedImage, nullptr);
-    SAFE_DESTROY_VK(vkDestroyImage, VulkanDevice, vkDepth.VkSharedImage, nullptr);
-    SAFE_DESTROY_VK(vkDestroyImage, VulkanDevice, vkReactive.VkSharedImage, nullptr);
-    SAFE_DESTROY_VK(vkDestroyImage, VulkanDevice, vkExp.VkSharedImage, nullptr);
-
-    SAFE_DESTROY_VK(vkDestroyImageView, VulkanDevice, vkColor.VkSharedImageView, nullptr);
-    SAFE_DESTROY_VK(vkDestroyImageView, VulkanDevice, vkMv.VkSharedImageView, nullptr);
-    SAFE_DESTROY_VK(vkDestroyImageView, VulkanDevice, vkOut.VkSharedImageView, nullptr);
-    SAFE_DESTROY_VK(vkDestroyImageView, VulkanDevice, vkDepth.VkSharedImageView, nullptr);
-    SAFE_DESTROY_VK(vkDestroyImageView, VulkanDevice, vkReactive.VkSharedImageView, nullptr);
-    SAFE_DESTROY_VK(vkDestroyImageView, VulkanDevice, vkExp.VkSharedImageView, nullptr);
-
-    SAFE_DESTROY_VK(vkFreeMemory, VulkanDevice, vkColor.VkSharedMemory, nullptr);
-    SAFE_DESTROY_VK(vkFreeMemory, VulkanDevice, vkMv.VkSharedMemory, nullptr);
-    SAFE_DESTROY_VK(vkFreeMemory, VulkanDevice, vkOut.VkSharedMemory, nullptr);
-    SAFE_DESTROY_VK(vkFreeMemory, VulkanDevice, vkDepth.VkSharedMemory, nullptr);
-    SAFE_DESTROY_VK(vkFreeMemory, VulkanDevice, vkReactive.VkSharedMemory, nullptr);
-    SAFE_DESTROY_VK(vkFreeMemory, VulkanDevice, vkExp.VkSharedMemory, nullptr);
-
-    // Release D3D12 resources, an upscale that didn't finish above can still be using them
-    Util::DelayedReleaseClear(vkColor.Dx12Resource);
-    Util::DelayedReleaseClear(vkMv.Dx12Resource);
-    Util::DelayedReleaseClear(vkOut.Dx12Resource);
-    Util::DelayedReleaseClear(vkDepth.Dx12Resource);
-    Util::DelayedReleaseClear(vkReactive.Dx12Resource);
-    Util::DelayedReleaseClear(vkExp.Dx12Resource);
-
-    // Close handles
-    SAFE_CLOSE_HANDLE(vkColor.SharedHandle);
-    SAFE_CLOSE_HANDLE(vkMv.SharedHandle);
-    SAFE_CLOSE_HANDLE(vkOut.SharedHandle);
-    SAFE_CLOSE_HANDLE(vkDepth.SharedHandle);
-    SAFE_CLOSE_HANDLE(vkReactive.SharedHandle);
-    SAFE_CLOSE_HANDLE(vkExp.SharedHandle);
+    // Release Vulkan and D3D12 resources, previous frames on both APIs can still be using them
+    ReleaseSharedResource(vkColor);
+    ReleaseSharedResource(vkMv);
+    ReleaseSharedResource(vkOut);
+    ReleaseSharedResource(vkDepth);
+    ReleaseSharedResource(vkReactive);
+    ReleaseSharedResource(vkExp);
 
     // Cleanup Vulkan copy command buffer
     // Loop in VulkanQueueCommandBuffers instead of hardcoding 2 command buffers, in case we have more in the future
@@ -1853,21 +1823,33 @@ void IFeature_VkwDx12::ReleaseSharedResources()
             if (b.VulkanBarrierCommandBuffer[i] != VK_NULL_HANDLE)
                 Vulkan_wDx12::DropPendingSubmissions(b.VulkanBarrierCommandBuffer[i]);
 
-            if (b.VulkanBarrierCommandBuffer[i] != VK_NULL_HANDLE && b.VulkanBarrierCommandPool[i] != VK_NULL_HANDLE)
+            // Vulkan submits of previous frames can still be using them
+            if (b.VulkanBarrierCommandPool[i] != VK_NULL_HANDLE || b.VulkanCopyCommandPool[i] != VK_NULL_HANDLE)
             {
-                vkFreeCommandBuffers(VulkanDevice, b.VulkanBarrierCommandPool[i], 1, &b.VulkanBarrierCommandBuffer[i]);
-                b.VulkanBarrierCommandBuffer[i] = VK_NULL_HANDLE;
+                DeferredRelease::Enqueue(
+                    [device = VulkanDevice, barrierPool = b.VulkanBarrierCommandPool[i],
+                     barrierBuffer = b.VulkanBarrierCommandBuffer[i], copyPool = b.VulkanCopyCommandPool[i],
+                     copyBuffer = b.VulkanCopyCommandBuffer[i]]()
+                    {
+                        if (barrierBuffer != VK_NULL_HANDLE && barrierPool != VK_NULL_HANDLE)
+                            vkFreeCommandBuffers(device, barrierPool, 1, &barrierBuffer);
+
+                        if (barrierPool != VK_NULL_HANDLE)
+                            vkDestroyCommandPool(device, barrierPool, nullptr);
+
+                        if (copyBuffer != VK_NULL_HANDLE && copyPool != VK_NULL_HANDLE)
+                            vkFreeCommandBuffers(device, copyPool, 1, &copyBuffer);
+
+                        if (copyPool != VK_NULL_HANDLE)
+                            vkDestroyCommandPool(device, copyPool, nullptr);
+                    },
+                    (uint64_t) VulkanDevice);
             }
 
-            SAFE_DESTROY_VK(vkDestroyCommandPool, VulkanDevice, b.VulkanBarrierCommandPool[i], nullptr);
-
-            if (b.VulkanCopyCommandBuffer[i] != VK_NULL_HANDLE && b.VulkanCopyCommandPool[i] != VK_NULL_HANDLE)
-            {
-                vkFreeCommandBuffers(VulkanDevice, b.VulkanCopyCommandPool[i], 1, &b.VulkanCopyCommandBuffer[i]);
-                b.VulkanCopyCommandBuffer[i] = VK_NULL_HANDLE;
-            }
-
-            SAFE_DESTROY_VK(vkDestroyCommandPool, VulkanDevice, b.VulkanCopyCommandPool[i], nullptr);
+            b.VulkanBarrierCommandBuffer[i] = VK_NULL_HANDLE;
+            b.VulkanBarrierCommandPool[i] = VK_NULL_HANDLE;
+            b.VulkanCopyCommandBuffer[i] = VK_NULL_HANDLE;
+            b.VulkanCopyCommandPool[i] = VK_NULL_HANDLE;
         }
     }
 
@@ -1877,17 +1859,17 @@ void IFeature_VkwDx12::ReleaseSharedResources()
 
     for (size_t i = 0; i < VKDX12_BUFFER_COUNT; i++)
     {
-        Util::DelayedReleaseClear(Dx12CommandList[i]);
-        Util::DelayedReleaseClear(Dx12CommandAllocator[i]);
+        DeferredRelease::Release(Dx12CommandList[i]);
+        DeferredRelease::Release(Dx12CommandAllocator[i]);
     }
 
-    Util::DelayedReleaseClear(Dx12CommandQueue);
-    Util::DelayedReleaseClear(Dx12Fence);
+    DeferredRelease::Release(Dx12CommandQueue);
+    DeferredRelease::Release(Dx12Fence);
 
     // The fence can still signal it if the wait in FinishPendingWork timed out
     if (Dx12FenceEvent != nullptr)
     {
-        Util::DelayedRun([event = Dx12FenceEvent]() { CloseHandle(event); });
+        DeferredRelease::Enqueue([event = Dx12FenceEvent]() { CloseHandle(event); });
         Dx12FenceEvent = nullptr;
     }
 
@@ -1908,7 +1890,7 @@ void IFeature_VkwDx12::ReleaseSharedResource(VK_TEXTURE2D_RESOURCE_C& resource)
     if (resource.VkSharedImage != VK_NULL_HANDLE || resource.VkSharedImageView != VK_NULL_HANDLE ||
         resource.VkSharedMemory != VK_NULL_HANDLE)
     {
-        Util::DelayedRun(
+        DeferredRelease::Enqueue(
             [device = VulkanDevice, image = resource.VkSharedImage, view = resource.VkSharedImageView,
              memory = resource.VkSharedMemory]()
             {
@@ -1920,7 +1902,8 @@ void IFeature_VkwDx12::ReleaseSharedResource(VK_TEXTURE2D_RESOURCE_C& resource)
 
                 if (memory != VK_NULL_HANDLE)
                     vkFreeMemory(device, memory, nullptr);
-            });
+            },
+            (uint64_t) VulkanDevice);
     }
 
     resource.VkSharedImage = VK_NULL_HANDLE;
@@ -1929,7 +1912,7 @@ void IFeature_VkwDx12::ReleaseSharedResource(VK_TEXTURE2D_RESOURCE_C& resource)
 
     SAFE_CLOSE_HANDLE(resource.SharedHandle);
 
-    Util::DelayedReleaseClear(resource.Dx12Resource);
+    DeferredRelease::Release(resource.Dx12Resource);
 }
 
 void IFeature_VkwDx12::ReleaseSyncResources()
@@ -1937,12 +1920,27 @@ void IFeature_VkwDx12::ReleaseSyncResources()
     LOG_FUNC();
     for (uint32_t i = 0; i < VKDX12_BUFFER_COUNT; i++)
     {
-        SAFE_DESTROY_VK(vkDestroySemaphore, VulkanDevice, vkSemaphoreTextureCopy[i], nullptr);
-        Util::DelayedReleaseClear(dx12FenceTextureCopy[i]);
+        // Pending submits can still wait or signal them
+        if (vkSemaphoreTextureCopy[i] != VK_NULL_HANDLE || vkSemaphoreCopyBack[i] != VK_NULL_HANDLE)
+        {
+            DeferredRelease::Enqueue(
+                [device = VulkanDevice, textureCopy = vkSemaphoreTextureCopy[i], copyBack = vkSemaphoreCopyBack[i]]()
+                {
+                    if (textureCopy != VK_NULL_HANDLE)
+                        vkDestroySemaphore(device, textureCopy, nullptr);
+
+                    if (copyBack != VK_NULL_HANDLE)
+                        vkDestroySemaphore(device, copyBack, nullptr);
+                },
+                (uint64_t) VulkanDevice);
+        }
+
+        vkSemaphoreTextureCopy[i] = VK_NULL_HANDLE;
+        vkSemaphoreCopyBack[i] = VK_NULL_HANDLE;
+
+        DeferredRelease::Release(dx12FenceTextureCopy[i]);
 
         SAFE_CLOSE_HANDLE(vkSHForTextureCopy[i]);
-
-        SAFE_DESTROY_VK(vkDestroySemaphore, VulkanDevice, vkSemaphoreCopyBack[i], nullptr);
     }
 }
 
