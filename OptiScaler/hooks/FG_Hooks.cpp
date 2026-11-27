@@ -1855,7 +1855,8 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
     bool mutexUsed = false;
     native::presenttiming::NoteFrameGenerationMutexWait(0.0);
     if (willPresent && fg != nullptr && fg->IsActive() && !fg->IsPaused() &&
-        config->FGUseMutexForSwapchain.value_or_default() && fg->Mutex.getOwner() != 2)
+        config->FGUseMutexForSwapchain.value_or_default() && fg->Mutex.getOwner() != 2 &&
+        !IsFgResizeOwner(fg->Mutex.getOwner()))
     {
         LOG_TRACE("Waiting FG->Mutex 2, current: {}", fg->Mutex.getOwner());
         const auto mutexWaitStartMs = Util::MillisecondsNow();

@@ -5,6 +5,11 @@
 #include <atomic>
 #include <shared_mutex>
 
+// Owners that are an FG swapchain resize in progress (3 = our wrapper's ResizeBuffers, 6677/6678 = ResizeScope in
+// FG_Hooks.cpp). The present side must not take the FG mutex while one of them holds it: the resize waits inside the
+// FG library for that library's present thread, which would be blocked on the mutex.
+inline bool IsFgResizeOwner(uint32_t owner) { return owner == 3 || owner == 6677 || owner == 6678; }
+
 class OwnedMutex
 {
   private:
