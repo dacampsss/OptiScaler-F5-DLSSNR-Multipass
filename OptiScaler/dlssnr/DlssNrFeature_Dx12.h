@@ -87,8 +87,8 @@ void RenderMenu(::Config* config, float menuResScale, MenuPages::Page page);
 // The F5LUT page's card (the LUT stack graded after NR, or on the upscaler's output with NR off).
 void RenderF5LutCard(::Config* config, float menuResScale);
 
-// The Image page's Input LUT card (file or custom realtime adjustments).
-void RenderInputLutCard(::Config* config, float menuResScale);
+// The Post-processing page's custom adjustments card.
+void RenderPostProcessingCard(::Config* config, float menuResScale);
 
 // The main menu's header line for the native modes (Optical F5Low), by the rule in menu/HeaderBanner.h. True when it
 // drew the line and its button, false when the line is the menu's own (a game's feature, or no offer to make).
