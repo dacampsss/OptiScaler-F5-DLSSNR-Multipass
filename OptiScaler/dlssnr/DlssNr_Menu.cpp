@@ -3850,8 +3850,8 @@ static void RenderOptionsPage(Config* config, float menuResScale, const NrCommon
     ImGui::Spacing();
 }
 
-// A 3D LUT graded onto the NR input image before the model sees it. Source can be a .cube file or custom
-// realtime adjustments generated into a 3D LUT.
+// LUT controls: file LUT can be applied as NR input; custom adjustments are applied as post-processing on the
+// final image.
 static void RenderLutSection(Config* config)
 {
     static std::vector<std::filesystem::path> lutFiles = ScanLutFolder();
@@ -3864,7 +3864,7 @@ static void RenderLutSection(Config* config)
     ImGui::SameLine();
     if (ImGui::RadioButton("Custom adjustments##lutsourcecustom", !fileSource))
         config->DlssNrLutSource = 1u;
-    HelpMarker("Choose a .cube LUT file, or generate a realtime 3D LUT from adjustment sliders.");
+    HelpMarker("Choose a .cube LUT file (applied before NR sees the image), or custom adjustments (applied as post-processing on the final image).");
 
     float strength = config->DlssNrLutStrength.value_or_default();
     if (ImGui::SliderFloat("LUT strength##lutstrength", &strength, 0.0f, 1.0f, "%.2f"))
@@ -3872,7 +3872,7 @@ static void RenderLutSection(Config* config)
     ImGui::SameLine();
     if (ImGui::SmallButton("Reset##lutstrength"))
         config->DlssNrLutStrength = 1.0f;
-    HelpMarker("How much of the LUT's grade reaches the image. 0 = no effect, 1 = the full grade.");
+    HelpMarker("How much of the selected LUT/adjustments is applied. 0 = no effect, 1 = full effect.");
 
     if (source == 0u)
     {
@@ -3903,9 +3903,9 @@ static void RenderLutSection(Config* config)
         if (ImGui::SmallButton("Rescan##lut"))
             lutFiles = ScanLutFolder();
 
-        HelpMarker("Applies a colour grade (.cube LUT) to the picture NR works from. Put files in OptiScaler\\LUTs and "
-                   "press Rescan. Strong grades also affect exposure, skin detection and reuse. To grade NR's result "
-                   "instead, use the F5LUT page.");
+        HelpMarker("Applies a .cube LUT to the picture NR works from. Put files in OptiScaler\\LUTs and "
+                   "press Rescan. Strong grades also affect exposure, skin detection and reuse. For final-image post-processing, "
+                   "use Custom adjustments or the F5LUT page.");
     }
     else
     {
