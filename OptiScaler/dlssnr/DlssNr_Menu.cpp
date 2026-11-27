@@ -5991,25 +5991,36 @@ void RenderPostProcessingCard(Config* config, float menuResScale)
                 config->DlssNrLutSaturation = 0.0f;
             }
 
-            const auto lutStatus = DlssNr::ReadLutStatus();
+            const auto postStatus = DlssNr::ReadPostLutStatus();
             if (ImGui::TreeNode("Status##postlut"))
             {
                 const float lutSlot = StatusSlotBegin();
                 ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-                if (!lutStatus.seen)
+                if (!postStatus.seen)
                     ImGui::TextWrapped("Waiting for a frame.");
-                else if (!lutStatus.wanted)
+                else if (!postStatus.wanted)
                     ImGui::TextWrapped("Custom adjustments neutral (no effect).");
-                else if (lutStatus.loaded)
-                    ImGui::TextWrapped("Active: %s (%d^3)", lutStatus.loadedPath.c_str(), lutStatus.size);
+                else if (postStatus.loaded)
+                    ImGui::TextWrapped("Active: %s", postStatus.chain.empty() ? "<custom adjustments>" : postStatus.chain.c_str());
+                else if (!postStatus.error.empty())
+                    ImGui::TextWrapped("Not applied.");
                 else
                     ImGui::TextWrapped("Not applied.");
                 ImGui::PopStyleColor();
 
-                if (lutStatus.failed)
+                if (!postStatus.error.empty())
                 {
                     ImGui::PushStyleColor(ImGuiCol_Text, kWarnAmber);
-                    ImGui::TextWrapped("%s: %s", lutStatus.attemptedPath.c_str(), lutStatus.error.c_str());
+                    ImGui::TextWrapped("%s%s%s",
+                                       postStatus.failedPath.empty() ? "" : postStatus.failedPath.c_str(),
+                                       postStatus.failedPath.empty() ? "" : ": ",
+                                       postStatus.error.c_str());
+                    ImGui::PopStyleColor();
+                }
+                if (!postStatus.note.empty())
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                    ImGui::TextWrapped("%s", postStatus.note.c_str());
                     ImGui::PopStyleColor();
                 }
                 StatusSlotEnd(lutSlot, 5);
