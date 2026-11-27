@@ -83,6 +83,7 @@ static LUID _lastAdapterLuid = {};
 // Common
 using PFN_SetDescriptorHeaps = rewrite_signature<decltype(&ID3D12GraphicsCommandList::SetDescriptorHeaps)>::type;
 using PFN_SetPipelineState = rewrite_signature<decltype(&ID3D12GraphicsCommandList::SetPipelineState)>::type;
+using PFN_Close = rewrite_signature<decltype(&ID3D12GraphicsCommandList::Close)>::type;
 
 // ComputeRoot
 using PFN_SetComputeRootSignature =
@@ -177,6 +178,7 @@ static RootRestoreHook<PFN_SetDescriptorHeaps> s_SetDescriptorHeaps {};
 static std::shared_mutex pipelineStatesMutex;
 static ankerl::unordered_dense::map<ID3D12GraphicsCommandList*, ID3D12PipelineState*> pipelineStates;
 static RootRestoreHook<PFN_SetPipelineState> s_SetPipelineState {};
+static RootRestoreHook<PFN_Close> s_Close {};
 
 // Those use a common rootSignatureMutex mutex
 static std::shared_mutex rootSignatureMutex;
@@ -392,7 +394,40 @@ static void ApplySamplerOverrides(D3D12_STATIC_SAMPLER_DESC1& samplerDesc)
     }
 }
 
+// A new list can reuse a released list's address and starts recording without a Reset: closing a list drops what was
+// recorded for it, so the next list at that address never restores the old one's heaps, pipeline or root signature
+static void ClearCmdListState(ID3D12GraphicsCommandList* commandList)
+{
+    if (commandList == nullptr)
+        return;
+
+    {
+        std::unique_lock<std::shared_mutex> lock(descriptorHeapsMutex);
+        descriptorHeaps.erase(commandList);
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(pipelineStatesMutex);
+        pipelineStates.erase(commandList);
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(rootSignatureMutex);
+        signatures.erase(commandList);
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(rootStatesMutex);
+        rootStates.erase(commandList);
+    }
+}
+
 // Early hooks, from Opti's own cmdlist
+VALIDATE_HOOK(hkClose, PFN_Close)
+static HRESULT hkClose(ID3D12GraphicsCommandList* commandList)
+{
+    auto result = s_Close.o_earlyHook(commandList);
+    ClearCmdListState(commandList);
+    return result;
+}
+
 VALIDATE_HOOK(hkSetPipelineState, PFN_SetPipelineState)
 static void hkSetPipelineState(ID3D12GraphicsCommandList* commandList, ID3D12PipelineState* pPipelineState)
 {
@@ -771,6 +806,14 @@ static void hkSetGraphicsRootUnorderedAccessView(ID3D12GraphicsCommandList* comm
 }
 
 // Late hooks, from upscaler eval
+VALIDATE_HOOK(hkCloseLate, PFN_Close)
+static HRESULT hkCloseLate(ID3D12GraphicsCommandList* commandList)
+{
+    auto result = s_Close.o_lateHook(commandList);
+    ClearCmdListState(commandList);
+    return result;
+}
+
 VALIDATE_HOOK(hkSetPipelineStateLate, PFN_SetPipelineState)
 static void hkSetPipelineStateLate(ID3D12GraphicsCommandList* commandList, ID3D12PipelineState* pPipelineState)
 {
@@ -1175,6 +1218,7 @@ void D3D12Hooks::HookToCommandListLate(ID3D12GraphicsCommandList* commandList)
     const bool extendedRestoreSignature = config->ExtendedStateRestore.value_or_default();
     const bool persistentBindings = config->FGHudfixPersistentBindings.value_or_default();
 
+    s_Close.o_lateHook = (PFN_Close) pVTable[9];
     s_SetPipelineState.o_lateHook = (PFN_SetPipelineState) pVTable[25];
     s_SetDescriptorHeaps.o_lateHook = (PFN_SetDescriptorHeaps) pVTable[28];
     s_SetComputeRootSignature.o_lateHook = (PFN_SetComputeRootSignature) pVTable[29];
@@ -1196,6 +1240,9 @@ void D3D12Hooks::HookToCommandListLate(ID3D12GraphicsCommandList* commandList)
         DetourUpdateThread(GetCurrentThread());
 
         // Common
+        if ((restoreComputeSignature || restoreGraphicSignature) && s_Close.o_lateHook != nullptr)
+            DetourAttach(&(PVOID&) s_Close.o_lateHook, hkCloseLate);
+
         if (extendedRestoreSignature && s_SetPipelineState.o_lateHook != nullptr)
             DetourAttach(&(PVOID&) s_SetPipelineState.o_lateHook, hkSetPipelineStateLate);
 
@@ -1302,6 +1349,7 @@ void D3D12Hooks::HookToCommandListLate(ID3D12GraphicsCommandList* commandList)
         }
         else
         {
+            s_Close.o_lateHook = nullptr;
             s_SetPipelineState.o_lateHook = nullptr;
             s_SetDescriptorHeaps.o_lateHook = nullptr;
             s_SetComputeRootSignature.o_lateHook = nullptr;
@@ -1342,6 +1390,7 @@ static void HookToCommandList(ID3D12Device* InDevice)
             const bool extendedRestoreSignature = config->ExtendedStateRestore.value_or_default();
             const bool persistentBindings = config->FGHudfixPersistentBindings.value_or_default();
 
+            s_Close.o_earlyHook = (PFN_Close) pVTable[9];
             s_SetPipelineState.o_earlyHook = (PFN_SetPipelineState) pVTable[25];
             s_SetDescriptorHeaps.o_earlyHook = (PFN_SetDescriptorHeaps) pVTable[28];
             s_SetComputeRootSignature.o_earlyHook = (PFN_SetComputeRootSignature) pVTable[29];
@@ -1361,6 +1410,9 @@ static void HookToCommandList(ID3D12Device* InDevice)
             {
                 DetourTransactionBegin();
                 DetourUpdateThread(GetCurrentThread());
+
+                if (s_Close.o_earlyHook != nullptr)
+                    DetourAttach(&(PVOID&) s_Close.o_earlyHook, hkClose);
 
                 if (s_SetPipelineState.o_earlyHook != nullptr && extendedRestoreSignature)
                     DetourAttach(&(PVOID&) s_SetPipelineState.o_earlyHook, hkSetPipelineState);
@@ -1412,6 +1464,7 @@ static void HookToCommandList(ID3D12Device* InDevice)
                 }
                 else
                 {
+                    s_Close.o_earlyHook = nullptr;
                     s_SetPipelineState.o_earlyHook = nullptr;
                     s_SetDescriptorHeaps.o_earlyHook = nullptr;
                     s_SetComputeRootSignature.o_earlyHook = nullptr;
@@ -1444,6 +1497,12 @@ static void UnhookAll()
 {
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
+
+    if (s_Close.o_earlyHook != nullptr)
+    {
+        DetourDetach(&(PVOID&) s_Close.o_earlyHook, hkClose);
+        s_Close.o_earlyHook = nullptr;
+    }
 
     if (s_SetComputeRootSignature.o_earlyHook != nullptr)
     {
@@ -2838,8 +2897,21 @@ void D3D12Hooks::SetRootSignatureTracking(bool enable) { isUpscalerActive = !ena
 
 bool D3D12Hooks::CanRestoreRootSignature(ID3D12GraphicsCommandList* cmdList)
 {
-    std::unique_lock<std::shared_mutex> lock(rootSignatureMutex);
-    return signatures.contains(cmdList);
+    // A list with only heaps or a pipeline recorded (no root signature yet) is restorable too
+    {
+        std::unique_lock<std::shared_mutex> lock(rootSignatureMutex);
+        if (signatures.contains(cmdList))
+            return true;
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(descriptorHeapsMutex);
+        if (descriptorHeaps.contains(cmdList))
+            return true;
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(pipelineStatesMutex);
+        return pipelineStates.contains(cmdList);
+    }
 }
 
 bool D3D12Hooks::RestoreDescriptorHeaps(ID3D12GraphicsCommandList* cmdList)
@@ -3045,7 +3117,7 @@ void D3D12Hooks::RestoreRoot(ID3D12GraphicsCommandList* cmdList)
                 if (RestoreDescriptorHeaps(cmdList))
                     LOG_TRACE("Restored DescriptorHeaps for CmdList: {:X}", (UINT64) cmdList);
                 else
-                    LOG_WARN("Can't restore DescriptorHeaps for CmdList: {:X}", (UINT64) cmdList);
+                    LOG_TRACE("Can't restore DescriptorHeaps for CmdList: {:X}", (UINT64) cmdList);
             }
 
             if (signature.type == SignatureEntryType::Compute)
@@ -3089,6 +3161,17 @@ void D3D12Hooks::RestoreRoot(ID3D12GraphicsCommandList* cmdList)
                 else
                     LOG_TRACE("Can't restore PipelineState for CmdList: {:X}", (UINT64) cmdList);
             }
+        }
+        else if (Config::Instance()->ExtendedStateRestore.value_or_default())
+        {
+            // Heaps and PSO are restored even when no root signature was set
+            LOG_TRACE("No Root Signature recorded for CmdList: {:X}, restoring heaps and PSO only", (UINT64) cmdList);
+
+            if (RestoreDescriptorHeaps(cmdList))
+                LOG_TRACE("Restored DescriptorHeaps for CmdList: {:X}", (UINT64) cmdList);
+
+            if (RestorePipelineState(cmdList))
+                LOG_TRACE("Restored PipelineState for CmdList: {:X}", (UINT64) cmdList);
         }
         else
         {

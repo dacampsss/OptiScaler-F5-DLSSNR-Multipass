@@ -312,6 +312,9 @@ bool IFeature_Dx11::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NGX_Par
 
     UpscalerTime->End(InDeviceContext);
 
+    // The game's own output goes back on every exit
+    InParameters->Set(NVSDK_NGX_Parameter_Output, paramOutput);
+
     if (!evalResult)
         result = false;
 
@@ -350,8 +353,6 @@ bool IFeature_Dx11::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NGX_Par
                 Imgui = std::make_unique<Menu_Dx11>(GetForegroundWindow(), Device);
         }
     }
-
-    InParameters->Set(NVSDK_NGX_Parameter_Output, paramOutput);
 
     // Restore null bindings too, but batch the API calls rather than adding hundreds of
     // per-slot calls to the ordinary D3D11 path.

@@ -689,18 +689,18 @@ ffxReturnCode_t FSRFG_Dx12::DispatchCallback(ffxDispatchDescFrameGeneration* par
     if ((applyHudCutoff || State::Instance().fgHudlessCompare) && !lastFGDisableHudless)
     {
         auto presentWithHud = (ID3D12Resource*) params->presentColor.resource;
-        auto hudlessResource = _resourceCopy[fIndex][FG_ResourceType::HudlessColor];
+        ID3D12Resource* hudlessResource = nullptr;
         auto hudlessState = D3D12_RESOURCE_STATE_COPY_DEST;
 
-        if (hudlessResource == nullptr)
+        // Only this frame's hudless, the copy map keeps older frames' copies
+        if (auto hudless = GetResource(FG_ResourceType::HudlessColor, fIndex))
         {
-            auto hudless = _frameResources[fIndex][FG_ResourceType::HudlessColor];
-            if (hudless.validity == FG_ResourceValidity::UntilPresent)
-                hudlessResource = hudless.GetResource();
-
-            // hudless.state only holds the state for the original resource, not the copy that we could get here
-            if (hudlessResource && hudlessResource == hudless.resource)
-                hudlessState = hudless.state;
+            // state follows GetResource(), the copy or the format transfer buffer when there is one
+            if (hudless->copy != nullptr || hudless->validity == FG_ResourceValidity::UntilPresent)
+            {
+                hudlessResource = hudless->GetResource();
+                hudlessState = hudless->state;
+            }
         }
 
         if (presentWithHud && hudlessResource)

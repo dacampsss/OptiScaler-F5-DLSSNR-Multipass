@@ -320,6 +320,17 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
 
     // UpscalerTime->End(InCmdBuffer);
 
+    // Restore original output pointer on every exit
+    if (paramOutput)
+    {
+        paramOutput->Resource.ImageViewInfo.Image = originalOutput.Image;
+        paramOutput->Resource.ImageViewInfo.ImageView = originalOutput.ImageView;
+        paramOutput->Resource.ImageViewInfo.SubresourceRange = originalOutput.SubresourceRange;
+        paramOutput->Resource.ImageViewInfo.Format = originalOutput.Format;
+        paramOutput->Resource.ImageViewInfo.Width = originalOutput.Width;
+        paramOutput->Resource.ImageViewInfo.Height = originalOutput.Height;
+    }
+
     if (!evalResult)
         return false;
 
@@ -333,17 +344,6 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
                 return false;
             }
         }
-    }
-
-    // Restore original output pointer
-    if (paramOutput)
-    {
-        paramOutput->Resource.ImageViewInfo.Image = originalOutput.Image;
-        paramOutput->Resource.ImageViewInfo.ImageView = originalOutput.ImageView;
-        paramOutput->Resource.ImageViewInfo.SubresourceRange = originalOutput.SubresourceRange;
-        paramOutput->Resource.ImageViewInfo.Format = originalOutput.Format;
-        paramOutput->Resource.ImageViewInfo.Width = originalOutput.Width;
-        paramOutput->Resource.ImageViewInfo.Height = originalOutput.Height;
     }
 
     _frameCount++;
