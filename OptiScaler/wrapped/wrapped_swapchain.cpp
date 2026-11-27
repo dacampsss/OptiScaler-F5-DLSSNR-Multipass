@@ -799,8 +799,9 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     else
         presentResult = ((IDXGISwapChain1*) pSwapChain)->Present1(SyncInterval, Flags, pPresentParameters);
 
-    // A DXGI_PRESENT_TEST is not a frame
-    if (willPresent)
+    // A DXGI_PRESENT_TEST is not a frame, and neither is a present on another window or the FG library's inner chain:
+    // the deferred release counts the game's frames (with 4x frame generation these would be several per game frame)
+    if (willPresent && isCurrent)
         DeferredRelease::Process();
 
     if (xefgPresent)
