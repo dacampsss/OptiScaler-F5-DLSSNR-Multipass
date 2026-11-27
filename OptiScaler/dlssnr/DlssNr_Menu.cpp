@@ -3850,105 +3850,56 @@ static void RenderOptionsPage(Config* config, float menuResScale, const NrCommon
     ImGui::Spacing();
 }
 
-// LUT controls: file LUT can be applied as NR input; custom adjustments are applied as post-processing on the
-// final image.
+// A 3D LUT (.cube) graded onto the NR input image before the model sees it (dlssnr-lut-apply epic,
+// Story 4). Scanned from the LUTs folder inside the OptiScaler folder; LutFile also accepts any path typed
+// into the ini directly, so the combo's preview shows the current selection's filename even when it
+// is not one of the scanned entries.
 static void RenderLutSection(Config* config)
 {
     static std::vector<std::filesystem::path> lutFiles = ScanLutFolder();
 
-    const uint32_t source = config->DlssNrLutSource.value_or_default() > 1u ? 0u : config->DlssNrLutSource.value_or_default();
-    ImGui::TextUnformatted("LUT source:");
-    bool fileSource = source == 0u;
-    if (ImGui::RadioButton("LUT file##lutsourcefile", fileSource))
-        config->DlssNrLutSource = 0u;
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Custom adjustments##lutsourcecustom", !fileSource))
-        config->DlssNrLutSource = 1u;
-    HelpMarker("Choose a .cube LUT file (applied before NR sees the image), or custom adjustments (applied as post-processing on the final image).");
+    const std::string current = config->DlssNrLutFile.value_or_default();
+    const std::string preview = current.empty() ? "(none)" : std::filesystem::path(current).filename().string();
 
-    float strength = config->DlssNrLutStrength.value_or_default();
-    if (ImGui::SliderFloat("LUT strength##lutstrength", &strength, 0.0f, 1.0f, "%.2f"))
-        config->DlssNrLutStrength = strength;
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Reset##lutstrength"))
-        config->DlssNrLutStrength = 1.0f;
-    HelpMarker("How much of the selected LUT/adjustments is applied. 0 = no effect, 1 = full effect.");
-
-    if (source == 0u)
+    if (ImGui::BeginCombo("Input LUT", preview.c_str()))
     {
-        const std::string current = config->DlssNrLutFile.value_or_default();
-        const std::string preview = current.empty() ? "(none)" : std::filesystem::path(current).filename().string();
+        const bool noneSelected = current.empty();
+        if (ImGui::Selectable("(none)", noneSelected))
+            config->DlssNrLutFile = std::string();
+        if (noneSelected)
+            ImGui::SetItemDefaultFocus();
 
-        if (ImGui::BeginCombo("Input LUT", preview.c_str()))
+        for (const auto& path : lutFiles)
         {
-            const bool noneSelected = current.empty();
-            if (ImGui::Selectable("(none)", noneSelected))
-                config->DlssNrLutFile = std::string();
-            if (noneSelected)
+            const std::string pathStr = path.string();
+            const bool selected = pathStr == current;
+            if (ImGui::Selectable(path.filename().string().c_str(), selected))
+                config->DlssNrLutFile = pathStr;
+            if (selected)
                 ImGui::SetItemDefaultFocus();
-
-            for (const auto& path : lutFiles)
-            {
-                const std::string pathStr = path.string();
-                const bool selected = pathStr == current;
-                if (ImGui::Selectable(path.filename().string().c_str(), selected))
-                    config->DlssNrLutFile = pathStr;
-                if (selected)
-                    ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
         }
+        ImGui::EndCombo();
+    }
+
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Rescan##lut"))
+        lutFiles = ScanLutFolder();
+
+    HelpMarker("Applies a colour grade (.cube LUT) to the picture NR works from. Put files in OptiScaler\\LUTs and "
+               "press Rescan. Strong grades also affect exposure, skin detection and reuse. To grade NR's result "
+               "instead, use the F5LUT page.");
+
+    if (!current.empty())
+    {
+        float strength = config->DlssNrLutStrength.value_or_default();
+        if (ImGui::SliderFloat("LUT strength", &strength, 0.0f, 1.0f, "%.2f"))
+            config->DlssNrLutStrength = strength;
 
         ImGui::SameLine();
-        if (ImGui::SmallButton("Rescan##lut"))
-            lutFiles = ScanLutFolder();
+        if (ImGui::SmallButton("Reset##lutstrength"))
+            config->DlssNrLutStrength = 1.0f;
 
-        HelpMarker("Applies a .cube LUT to the picture NR works from. Put files in OptiScaler\\LUTs and "
-                   "press Rescan. Strong grades also affect exposure, skin detection and reuse. For final-image post-processing, "
-                   "use Custom adjustments or the F5LUT page.");
-    }
-    else
-    {
-        auto slider = [&](const char* label, const char* resetId, CustomOptional<float>& opt, float minV, float maxV,
-                          const char* fmt, const char* tip)
-        {
-            float v = opt.value_or_default();
-            if (ImGui::SliderFloat(label, &v, minV, maxV, fmt))
-                opt = std::clamp(v, minV, maxV);
-            ImGui::SameLine();
-            if (ImGui::SmallButton(resetId))
-                opt = 0.0f;
-            HelpMarker(tip);
-        };
-
-        slider("Exposure##lutexp", "Reset##lutexp", config->DlssNrLutExposure, -3.0f, 3.0f, "%.2f EV",
-               "Exposure in EV. 0 = neutral.");
-        slider("Brightness##lutbri", "Reset##lutbri", config->DlssNrLutBrightness, -1.0f, 1.0f, "%.2f",
-               "Brightness offset. 0 = neutral.");
-        slider("Gamma##lutgamma", "Reset##lutgamma", config->DlssNrLutGamma, -1.0f, 1.0f, "%.2f",
-               "Gamma curve. Positive brightens midtones, negative darkens midtones. 0 = neutral.");
-        slider("Blacks##lutblack", "Reset##lutblack", config->DlssNrLutBlacks, -1.0f, 1.0f, "%.2f",
-               "Black level. Positive lifts blacks, negative crushes blacks. 0 = neutral.");
-        slider("Whites##lutwhite", "Reset##lutwhite", config->DlssNrLutWhites, -1.0f, 1.0f, "%.2f",
-               "White level. Positive lowers white point, negative raises it. 0 = neutral.");
-        slider("Contrast##lutcontrast", "Reset##lutcontrast", config->DlssNrLutContrast, -1.0f, 1.0f, "%.2f",
-               "Contrast around mid gray. 0 = neutral.");
-        slider("Temperature##luttemp", "Reset##luttemp", config->DlssNrLutTemperature, -1.0f, 1.0f, "%.2f",
-               "Color temperature. Negative = cooler, positive = warmer. 0 = neutral.");
-        slider("Saturation##lutsat", "Reset##lutsat", config->DlssNrLutSaturation, -1.0f, 1.0f, "%.2f",
-               "Color saturation. -1 = grayscale, 0 = neutral, 1 = more saturated.");
-
-        if (ImGui::SmallButton("Reset all custom adjustments##lutresetall"))
-        {
-            config->DlssNrLutExposure = 0.0f;
-            config->DlssNrLutBrightness = 0.0f;
-            config->DlssNrLutGamma = 0.0f;
-            config->DlssNrLutBlacks = 0.0f;
-            config->DlssNrLutWhites = 0.0f;
-            config->DlssNrLutContrast = 0.0f;
-            config->DlssNrLutTemperature = 0.0f;
-            config->DlssNrLutSaturation = 0.0f;
-        }
+        HelpMarker("How much of the LUT's grade reaches the image. 0 = no effect, 1 = the full grade.");
     }
 
     const auto lutStatus = DlssNr::ReadLutStatus();
@@ -3959,7 +3910,7 @@ static void RenderLutSection(Config* config)
         if (!lutStatus.seen)
             ImGui::TextWrapped("Waiting for a frame.");
         else if (!lutStatus.wanted)
-            ImGui::TextWrapped(source == 1u ? "Custom LUT neutral (no effect)." : "No LUT loaded.");
+            ImGui::TextWrapped("No LUT loaded.");
         else if (lutStatus.loaded)
             ImGui::TextWrapped("Loaded: %s (%d^3)",
                                std::filesystem::path(lutStatus.loadedPath).filename().string().c_str(), lutStatus.size);
@@ -3969,6 +3920,10 @@ static void RenderLutSection(Config* config)
 
         if (lutStatus.failed)
         {
+            // Wrapped: a parse error can be longer than the menu is wide. A failed attempt does not
+            // necessarily mean nothing is loaded -- a working LUT stays active if a later, different
+            // path fails (DlssNr_Lut.h's documented contract) -- so this is shown alongside, not
+            // instead of, the line above.
             ImGui::PushStyleColor(ImGuiCol_Text, kWarnAmber);
             ImGui::TextWrapped("%s: %s", std::filesystem::path(lutStatus.attemptedPath).filename().string().c_str(),
                                lutStatus.error.c_str());
@@ -5966,21 +5921,102 @@ void RenderF5LutCard(Config* config, float menuResScale)
         RenderPostLutSection(config);
 }
 
-void RenderInputLutCard(Config* config, float menuResScale)
+void RenderPostProcessingCard(Config* config, float menuResScale)
 {
-    const bool lutOn = config->DlssNrLutSource.value_or_default() == 1u ||
-                       !config->DlssNrLutFile.value_or_default().empty() ||
-                       !DlssNr::IsNeutralCustomLut({ config->DlssNrLutExposure.value_or_default(),
-                                                     config->DlssNrLutBrightness.value_or_default(),
-                                                     config->DlssNrLutGamma.value_or_default(),
-                                                     config->DlssNrLutBlacks.value_or_default(),
-                                                     config->DlssNrLutWhites.value_or_default(),
-                                                     config->DlssNrLutContrast.value_or_default(),
-                                                     config->DlssNrLutTemperature.value_or_default(),
-                                                     config->DlssNrLutSaturation.value_or_default() });
+    const bool customOn = config->DlssNrLutSource.value_or_default() == 1u &&
+                          !DlssNr::IsNeutralCustomLut({ config->DlssNrLutExposure.value_or_default(),
+                                                        config->DlssNrLutBrightness.value_or_default(),
+                                                        config->DlssNrLutGamma.value_or_default(),
+                                                        config->DlssNrLutBlacks.value_or_default(),
+                                                        config->DlssNrLutWhites.value_or_default(),
+                                                        config->DlssNrLutContrast.value_or_default(),
+                                                        config->DlssNrLutTemperature.value_or_default(),
+                                                        config->DlssNrLutSaturation.value_or_default() });
 
-    if (NrCard card("Input LUT##card", menuResScale, lutOn); card.IsOpen())
-        RenderLutSection(config);
+    if (NrCard card("Custom adjustments##postprocessing", menuResScale, customOn); card.IsOpen())
+    {
+        bool enabled = config->DlssNrLutSource.value_or_default() == 1u;
+        if (ImGui::Checkbox("Enable custom post-processing adjustments##postprocessingenable", &enabled))
+            config->DlssNrLutSource = enabled ? 1u : 0u;
+        HelpMarker("Applies custom adjustments to the final image as post-processing. 0/middle is neutral.");
+
+        if (enabled)
+        {
+            float strength = config->DlssNrLutStrength.value_or_default();
+            if (ImGui::SliderFloat("Strength##poststrength", &strength, 0.0f, 1.0f, "%.2f"))
+                config->DlssNrLutStrength = strength;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reset##poststrength"))
+                config->DlssNrLutStrength = 1.0f;
+            HelpMarker("How much of the custom adjustments is applied to the final image.");
+
+            auto slider = [&](const char* label, const char* resetId, CustomOptional<float>& opt, float minV, float maxV,
+                              const char* fmt, const char* tip)
+            {
+                float v = opt.value_or_default();
+                if (ImGui::SliderFloat(label, &v, minV, maxV, fmt))
+                    opt = std::clamp(v, minV, maxV);
+                ImGui::SameLine();
+                if (ImGui::SmallButton(resetId))
+                    opt = 0.0f;
+                HelpMarker(tip);
+            };
+
+            slider("Exposure##postexp", "Reset##postexp", config->DlssNrLutExposure, -3.0f, 3.0f, "%.2f EV",
+                   "Exposure in EV. 0 = neutral.");
+            slider("Brightness##postbri", "Reset##postbri", config->DlssNrLutBrightness, -1.0f, 1.0f, "%.2f",
+                   "Brightness offset. 0 = neutral.");
+            slider("Gamma##postgamma", "Reset##postgamma", config->DlssNrLutGamma, -1.0f, 1.0f, "%.2f",
+                   "Gamma curve. Positive brightens midtones, negative darkens midtones. 0 = neutral.");
+            slider("Blacks##postblack", "Reset##postblack", config->DlssNrLutBlacks, -1.0f, 1.0f, "%.2f",
+                   "Black level. Positive lifts blacks, negative crushes blacks. 0 = neutral.");
+            slider("Whites##postwhite", "Reset##postwhite", config->DlssNrLutWhites, -1.0f, 1.0f, "%.2f",
+                   "White level. Positive lowers white point, negative raises it. 0 = neutral.");
+            slider("Contrast##postcontrast", "Reset##postcontrast", config->DlssNrLutContrast, -1.0f, 1.0f, "%.2f",
+                   "Contrast around mid gray. 0 = neutral.");
+            slider("Temperature##posttemp", "Reset##posttemp", config->DlssNrLutTemperature, -1.0f, 1.0f, "%.2f",
+                   "Color temperature. Negative = cooler, positive = warmer. 0 = neutral.");
+            slider("Saturation##postsat", "Reset##postsat", config->DlssNrLutSaturation, -1.0f, 1.0f, "%.2f",
+                   "Color saturation. -1 = grayscale, 0 = neutral, 1 = more saturated.");
+
+            if (ImGui::SmallButton("Reset all custom adjustments##postresetall"))
+            {
+                config->DlssNrLutExposure = 0.0f;
+                config->DlssNrLutBrightness = 0.0f;
+                config->DlssNrLutGamma = 0.0f;
+                config->DlssNrLutBlacks = 0.0f;
+                config->DlssNrLutWhites = 0.0f;
+                config->DlssNrLutContrast = 0.0f;
+                config->DlssNrLutTemperature = 0.0f;
+                config->DlssNrLutSaturation = 0.0f;
+            }
+
+            const auto lutStatus = DlssNr::ReadLutStatus();
+            if (ImGui::TreeNode("Status##postlut"))
+            {
+                const float lutSlot = StatusSlotBegin();
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                if (!lutStatus.seen)
+                    ImGui::TextWrapped("Waiting for a frame.");
+                else if (!lutStatus.wanted)
+                    ImGui::TextWrapped("Custom adjustments neutral (no effect).");
+                else if (lutStatus.loaded)
+                    ImGui::TextWrapped("Active: %s (%d^3)", lutStatus.loadedPath.c_str(), lutStatus.size);
+                else
+                    ImGui::TextWrapped("Not applied.");
+                ImGui::PopStyleColor();
+
+                if (lutStatus.failed)
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, kWarnAmber);
+                    ImGui::TextWrapped("%s: %s", lutStatus.attemptedPath.c_str(), lutStatus.error.c_str());
+                    ImGui::PopStyleColor();
+                }
+                StatusSlotEnd(lutSlot, 5);
+                ImGui::TreePop();
+            }
+        }
+    }
 }
 
 void RenderMenu(Config* config, float menuResScale, MenuPages::Page page)
