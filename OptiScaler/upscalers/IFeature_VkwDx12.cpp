@@ -1275,6 +1275,11 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
 #endif
         }
     }
+    else
+    {
+        // Evaluate passes the copy to the backend, last frame's must not be used
+        ReleaseSharedResource(vkExp);
+    }
 
     if (paramReactiveMask != nullptr)
     {
@@ -1298,6 +1303,10 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
                             (uint64_t) paramReactiveMask->Resource.ImageViewInfo.Image, "ReactiveMask");
 #endif
         }
+    }
+    else
+    {
+        ReleaseSharedResource(vkReactive);
     }
 
 #pragma endregion
@@ -1889,6 +1898,37 @@ void IFeature_VkwDx12::ReleaseSharedResources()
     ExpCopy.reset();
     OutCopy.reset();
     OutCopy2.reset();
+}
+
+// One shared copy dropped (an optional input that is not given any more), previous frames on both APIs can still be
+// using it
+void IFeature_VkwDx12::ReleaseSharedResource(VK_TEXTURE2D_RESOURCE_C& resource)
+{
+    if (resource.VkSharedImage != VK_NULL_HANDLE || resource.VkSharedImageView != VK_NULL_HANDLE ||
+        resource.VkSharedMemory != VK_NULL_HANDLE)
+    {
+        Util::DelayedRun(
+            [device = VulkanDevice, image = resource.VkSharedImage, view = resource.VkSharedImageView,
+             memory = resource.VkSharedMemory]()
+            {
+                if (view != VK_NULL_HANDLE)
+                    vkDestroyImageView(device, view, nullptr);
+
+                if (image != VK_NULL_HANDLE)
+                    vkDestroyImage(device, image, nullptr);
+
+                if (memory != VK_NULL_HANDLE)
+                    vkFreeMemory(device, memory, nullptr);
+            });
+    }
+
+    resource.VkSharedImage = VK_NULL_HANDLE;
+    resource.VkSharedImageView = VK_NULL_HANDLE;
+    resource.VkSharedMemory = VK_NULL_HANDLE;
+
+    SAFE_CLOSE_HANDLE(resource.SharedHandle);
+
+    Util::DelayedReleaseClear(resource.Dx12Resource);
 }
 
 void IFeature_VkwDx12::ReleaseSyncResources()

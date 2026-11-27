@@ -558,7 +558,7 @@ hkffxFrameInterpolationContextCreate(FfxFrameInterpolationContext* context,
     if (uf != nullptr && !uf->LowResMV())
         _fgConst.flags |= FG_Flags::DisplayResolutionMVs;
 
-    if (uf != nullptr && !uf->JitteredMV())
+    if (uf != nullptr && uf->JitteredMV())
         _fgConst.flags |= FG_Flags::JitteredMVs;
 
     if ((contextDescription->flags & FFX_FRAMEINTERPOLATION_ENABLE_DEPTH_INVERTED) > 0)
@@ -579,6 +579,16 @@ hkffxFrameInterpolationContextCreate(FfxFrameInterpolationContext* context,
     Config::Instance()->SaveXeFG();
 
     _device = State::Instance().currentD3D12Device;
+
+    // No game swapchain yet, only trust the backend device if it is a known D3D12 device
+    if (_device == nullptr)
+    {
+        auto backendDevice = (ID3D12Device*) contextDescription->backendInterface.device;
+        auto& devices = State::Instance().d3d12Devices;
+
+        if (std::find(devices.begin(), devices.end(), backendDevice) != devices.end())
+            _device = backendDevice;
+    }
 
     State::Instance().currentFG->CreateContext(_device, _fgConst);
 
@@ -717,7 +727,7 @@ static Fsr3::FfxErrorCode hkffxFsr3ConfigureFrameGeneration(void* context, Fsr3:
         }
         else if (!config->frameGenerationEnabled && fg->IsActive())
         {
-            fg->Deactivate();
+            fg->Disable();
             fg->ResetCounters();
         }
 
@@ -749,8 +759,6 @@ static Fsr3::FfxErrorCode hkffxFsr3ConfigureFrameGeneration(void* context, Fsr3:
             ui.width = width;
             ui.left = left;
             ui.top = top;
-
-            _uiRes[fg->GetIndex()] = ui;
 
             fg->SetResource(&ui);
         }
@@ -801,7 +809,7 @@ static Fsr3::FfxErrorCode hkffxSetFrameGenerationConfigToSwapchainDX12(Fsr3::Ffx
         }
         else if (!config->frameGenerationEnabled && fg->IsActive())
         {
-            fg->Deactivate();
+            fg->Disable();
             fg->ResetCounters();
         }
 
@@ -833,8 +841,6 @@ static Fsr3::FfxErrorCode hkffxSetFrameGenerationConfigToSwapchainDX12(Fsr3::Ffx
             ui.width = width;
             ui.left = left;
             ui.top = top;
-
-            _uiRes[fg->GetIndex()] = ui;
 
             fg->SetResource(&ui);
         }

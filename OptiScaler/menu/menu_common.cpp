@@ -4351,7 +4351,7 @@ void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
                     {
                         config->FGUIPremultipliedAlpha = uiPremultipliedAlpha;
                     }
-                    ShowHelpMarker("Only with Draw UI over. If the UI looks too faint, turn this off");
+                    ShowHelpMarker("Only with Draw UI over. If the UI looks too bright, turn this off");
 
                     ImGui::EndDisabled();
                     ImGui::EndTable();

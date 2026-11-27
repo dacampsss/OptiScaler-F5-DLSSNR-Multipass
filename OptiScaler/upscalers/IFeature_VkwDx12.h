@@ -136,6 +136,7 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
     bool CreateSharedFenceSemaphore();
 
     void ReleaseSharedResources();
+    void ReleaseSharedResource(VK_TEXTURE2D_RESOURCE_C& resource);
     // Lets the last upscale finish on D3D12
     void FinishPendingWork();
     void ReleaseSyncResources();

@@ -80,6 +80,11 @@ bool OS_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
     FsrEasuCon(fsr1Constants.const0, fsr1Constants.const1, fsr1Constants.const2, fsr1Constants.const3, srcW, srcH,
                srcW, srcH, dstW, dstH);
 
+    // EASU only upscales, downscaling stays on the shader's bilinear path. Output Scaling and the Magnifier only: a
+    // Neural Rendering instance (_scalerOverride set) keeps the constants as zero, as before (the constants block is
+    // shared by every instance)
+    fsr1Constants.squaredRadius = (_scalerOverride == Scaler::Count && srcW < dstW) ? UINT32_MAX : 0;
+
     constants.srcWidth = srcW;
     constants.srcHeight = srcH;
     constants.destWidth = dstW;
