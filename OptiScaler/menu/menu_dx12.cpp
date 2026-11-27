@@ -74,7 +74,7 @@ bool Menu_Dx12::Render(ID3D12GraphicsCommandList* pCmdList, ID3D12Resource* outT
         IM_ASSERT(SUCCEEDED(hr));
 
         initInfo.NumFramesInFlight = 2;
-        initInfo.RTVFormat = outDesc.Format;
+        initInfo.RTVFormat = TranslateTypelessFormats(outDesc.Format);
         initInfo.DSVFormat = DXGI_FORMAT_UNKNOWN;
         initInfo.SrvDescriptorHeap = _srvDescHeap;
         initInfo.SrvDescriptorAllocFn = [](ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE* out_cpu_handle,
@@ -101,7 +101,7 @@ bool Menu_Dx12::Render(ID3D12GraphicsCommandList* pCmdList, ID3D12Resource* outT
     auto backbuf = frameCounter % 2;
 
     D3D12_RENDER_TARGET_VIEW_DESC rtDesc = {};
-    rtDesc.Format = outDesc.Format;
+    rtDesc.Format = TranslateTypelessFormats(outDesc.Format);
     rtDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
 
     if ((outDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) > 0)
@@ -254,10 +254,11 @@ Menu_Dx12::~Menu_Dx12()
     ImGui_ImplDX12_Shutdown(true, !State::Instance().isShuttingDown);
     MenuCommon::Shutdown();
 
-    SAFE_RELEASE(_rtvDescHeap);
-    SAFE_RELEASE(_srvDescHeap);
-    SAFE_RELEASE(_renderTargetResource[0]);
-    SAFE_RELEASE(_renderTargetResource[1]);
+    // The last menu render can still be running
+    Util::DelayedReleaseClear(_rtvDescHeap);
+    Util::DelayedReleaseClear(_srvDescHeap);
+    Util::DelayedReleaseClear(_renderTargetResource[0]);
+    Util::DelayedReleaseClear(_renderTargetResource[1]);
 }
 
 void Menu_Dx12::CreateRenderTarget(const D3D12_RESOURCE_DESC& InDesc)
@@ -307,7 +308,7 @@ void Menu_Dx12::CreateRenderTarget(const D3D12_RESOURCE_DESC& InDesc)
             renderTarget->SetName(L"Imgui_Dx12_renderTarget");
 
             D3D12_RENDER_TARGET_VIEW_DESC rtDesc = {};
-            rtDesc.Format = InDesc.Format;
+            rtDesc.Format = desc.Format;
             rtDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
 
             _device->CreateRenderTargetView(renderTarget, &rtDesc, _renderTargetDescriptor[i]);

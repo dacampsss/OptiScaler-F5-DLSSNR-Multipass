@@ -1930,6 +1930,10 @@ static void hkvkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAll
     if (device != VK_NULL_HANDLE)
         DlssNr::VkExt::ForgetDevice(device);
 
+    // Objects created on the device have to go before it
+    if (device != VK_NULL_HANDLE)
+        MenuOverlayVk::ReleaseDevice(device);
+
     if (device != VK_NULL_HANDLE)
     {
         VkPresentBridge::OnDeviceDestroying(device);

@@ -437,6 +437,16 @@ static FfxErrorCode ffxFsr2ContextDispatch_Vk(FfxFsr2Context* context,
     if (fsrTransparencyView != nullptr)
         vkDestroyImageView(_vkDevice, fsrTransparencyView, nullptr);
 
+    // Destroyed above: a view that isn't made again this frame must not be destroyed twice next frame
+    depthImageView = VK_NULL_HANDLE;
+    expImageView = VK_NULL_HANDLE;
+    biasImageView = VK_NULL_HANDLE;
+    colorImageView = VK_NULL_HANDLE;
+    mvImageView = VK_NULL_HANDLE;
+    outputImageView = VK_NULL_HANDLE;
+    fsrReactiveView = VK_NULL_HANDLE;
+    fsrTransparencyView = VK_NULL_HANDLE;
+
     // generate new ones with nvidia resource infos
     if (dispatchDescription->depth.resource == nullptr ||
         !CreateIVandNVRes(dispatchDescription->depth, &depthImageView, &depthNVRes, false, true))
@@ -454,11 +464,19 @@ static FfxErrorCode ffxFsr2ContextDispatch_Vk(FfxFsr2Context* context,
     {
         params->Set(NVSDK_NGX_Parameter_ExposureTexture, &expNVRes);
     }
+    else
+    {
+        params->Set(NVSDK_NGX_Parameter_ExposureTexture, (void*) nullptr);
+    }
 
     if (dispatchDescription->reactive.resource != nullptr &&
         CreateIVandNVRes(dispatchDescription->reactive, &biasImageView, &biasNVRes))
     {
         params->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, &biasNVRes);
+    }
+    else
+    {
+        params->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, (void*) nullptr);
     }
 
     if (dispatchDescription->color.resource == nullptr ||

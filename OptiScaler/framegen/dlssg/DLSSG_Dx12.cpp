@@ -663,11 +663,12 @@ void DLSSG_Dx12::ReleaseObjects()
 {
     for (size_t i = 0; i < BUFFER_COUNT; i++)
     {
-        SAFE_RELEASE(_uiCommandAllocator[i]);
-        SAFE_RELEASE(_uiCommandList[i]);
-        SAFE_RELEASE(_scCommandAllocator[i]);
-        SAFE_RELEASE(_scCommandList[i]);
-        SAFE_RELEASE(dlssgFence[i]);
+        // The GPU can still be executing them
+        Util::DelayedReleaseClear(_uiCommandAllocator[i]);
+        Util::DelayedReleaseClear(_uiCommandList[i]);
+        Util::DelayedReleaseClear(_scCommandAllocator[i]);
+        Util::DelayedReleaseClear(_scCommandList[i]);
+        Util::DelayedReleaseClear(dlssgFence[i]);
 
         // Reset command list state
         _scCommandListResetted[i] = false;
@@ -676,6 +677,8 @@ void DLSSG_Dx12::ReleaseObjects()
         _uiCommandListResetted[i] = false;
         _uiAllocatorFenceValues[i] = 0;
     }
+
+    ReleaseUIFence();
 
     _renderUI.reset();
     _hudlessCompare.reset();

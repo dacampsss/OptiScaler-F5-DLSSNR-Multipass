@@ -444,11 +444,27 @@ bool IFGFeature_Dx12::InitCopyCmdList()
 
 void IFGFeature_Dx12::DestroyCopyCmdList()
 {
+    // The GPU can still be executing them
     for (size_t i = 0; i < BUFFER_COUNT; i++)
     {
-        SAFE_RELEASE(_copyCommandAllocator[i]);
-        SAFE_RELEASE(_copyCommandList[i]);
+        Util::DelayedReleaseClear(_copyCommandAllocator[i]);
+        Util::DelayedReleaseClear(_copyCommandList[i]);
     }
+}
+
+void IFGFeature_Dx12::ReleaseUIFence()
+{
+    // Recreated with the objects, so it is never signaled from another device's queue
+    Util::DelayedReleaseClear(_uiFence);
+
+    if (_uiFenceEvent != nullptr)
+    {
+        Util::DelayedRun([event = _uiFenceEvent]() { CloseHandle(event); });
+        _uiFenceEvent = nullptr;
+    }
+
+    _uiFenceValue = 0;
+    memset(_uiAllocatorFenceValues, 0, sizeof(_uiAllocatorFenceValues));
 }
 
 bool IFGFeature_Dx12::CreateBufferResource(ID3D12Device* device, ID3D12Resource* source,

@@ -82,7 +82,8 @@ void Dx11WithDx12::ReleaseSharedResource(D3D11_TEXTURE2D_RESOURCE_C* resource)
     if (resource == nullptr)
         return;
 
-    SAFE_RELEASE(resource->Dx12Resource);
+    // D3D12 queue can still be using it
+    Util::DelayedReleaseClear(resource->Dx12Resource);
 
     if (resource->Dx11Handle != NULL && resource->UsesNTHandle)
         CloseHandle(resource->Dx11Handle);

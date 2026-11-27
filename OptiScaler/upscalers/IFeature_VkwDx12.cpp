@@ -656,7 +656,8 @@ bool IFeature_VkwDx12::CopyTextureFromVkToDx12(VkCommandBuffer InCmdBuffer, NVSD
 
         SAFE_CLOSE_HANDLE(OutResource->SharedHandle);
 
-        SAFE_RELEASE(OutResource->Dx12Resource);
+        // D3D12 previous frames can still be using it
+        Util::DelayedReleaseClear(OutResource->Dx12Resource);
 
         ASSIGN_VK_DESC((*OutResource), (*OutResource), InParam->Resource.ImageViewInfo.Width,
                        InParam->Resource.ImageViewInfo.Height, InParam->Resource.ImageViewInfo.Format);
@@ -1816,13 +1817,13 @@ void IFeature_VkwDx12::ReleaseSharedResources()
     SAFE_DESTROY_VK(vkFreeMemory, VulkanDevice, vkReactive.VkSharedMemory, nullptr);
     SAFE_DESTROY_VK(vkFreeMemory, VulkanDevice, vkExp.VkSharedMemory, nullptr);
 
-    // Release D3D12 resources
-    SAFE_RELEASE(vkColor.Dx12Resource);
-    SAFE_RELEASE(vkMv.Dx12Resource);
-    SAFE_RELEASE(vkOut.Dx12Resource);
-    SAFE_RELEASE(vkDepth.Dx12Resource);
-    SAFE_RELEASE(vkReactive.Dx12Resource);
-    SAFE_RELEASE(vkExp.Dx12Resource);
+    // Release D3D12 resources, an upscale that didn't finish above can still be using them
+    Util::DelayedReleaseClear(vkColor.Dx12Resource);
+    Util::DelayedReleaseClear(vkMv.Dx12Resource);
+    Util::DelayedReleaseClear(vkOut.Dx12Resource);
+    Util::DelayedReleaseClear(vkDepth.Dx12Resource);
+    Util::DelayedReleaseClear(vkReactive.Dx12Resource);
+    Util::DelayedReleaseClear(vkExp.Dx12Resource);
 
     // Close handles
     SAFE_CLOSE_HANDLE(vkColor.SharedHandle);
@@ -1866,14 +1867,19 @@ void IFeature_VkwDx12::ReleaseSharedResources()
 
     for (size_t i = 0; i < VKDX12_BUFFER_COUNT; i++)
     {
-        SAFE_RELEASE(Dx12CommandList[i]);
-        SAFE_RELEASE(Dx12CommandAllocator[i]);
+        Util::DelayedReleaseClear(Dx12CommandList[i]);
+        Util::DelayedReleaseClear(Dx12CommandAllocator[i]);
     }
 
-    SAFE_RELEASE(Dx12CommandQueue);
-    SAFE_RELEASE(Dx12Fence);
+    Util::DelayedReleaseClear(Dx12CommandQueue);
+    Util::DelayedReleaseClear(Dx12Fence);
 
-    SAFE_CLOSE_HANDLE(Dx12FenceEvent);
+    // The fence can still signal it if the wait in FinishPendingWork timed out
+    if (Dx12FenceEvent != nullptr)
+    {
+        Util::DelayedRun([event = Dx12FenceEvent]() { CloseHandle(event); });
+        Dx12FenceEvent = nullptr;
+    }
 
     ColorCopy.reset();
     VelocityCopy.reset();
@@ -1891,7 +1897,7 @@ void IFeature_VkwDx12::ReleaseSyncResources()
     for (uint32_t i = 0; i < VKDX12_BUFFER_COUNT; i++)
     {
         SAFE_DESTROY_VK(vkDestroySemaphore, VulkanDevice, vkSemaphoreTextureCopy[i], nullptr);
-        SAFE_RELEASE(dx12FenceTextureCopy[i]);
+        Util::DelayedReleaseClear(dx12FenceTextureCopy[i]);
 
         SAFE_CLOSE_HANDLE(vkSHForTextureCopy[i]);
 

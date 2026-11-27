@@ -1409,12 +1409,13 @@ void FSRFG_Dx12::ReleaseObjects()
         _hudCopy[i].reset();
         _hudlessCompareCompute[i].reset();
 
-        SAFE_RELEASE(_fgCommandAllocator[i]);
-        SAFE_RELEASE(_fgCommandList[i]);
-        SAFE_RELEASE(_uiCommandAllocator[i]);
-        SAFE_RELEASE(_uiCommandList[i]);
-        SAFE_RELEASE(_scCommandAllocator[i]);
-        SAFE_RELEASE(_scCommandList[i]);
+        // The GPU can still be executing them
+        Util::DelayedReleaseClear(_fgCommandAllocator[i]);
+        Util::DelayedReleaseClear(_fgCommandList[i]);
+        Util::DelayedReleaseClear(_uiCommandAllocator[i]);
+        Util::DelayedReleaseClear(_uiCommandList[i]);
+        Util::DelayedReleaseClear(_scCommandAllocator[i]);
+        Util::DelayedReleaseClear(_scCommandList[i]);
 
         // Reset command list state
         _scCommandListResetted[i] = false;
@@ -1423,6 +1424,8 @@ void FSRFG_Dx12::ReleaseObjects()
         _uiCommandListResetted[i] = false;
         _uiAllocatorFenceValues[i] = 0;
     }
+
+    ReleaseUIFence();
 
     _renderUI.reset();
     _hudlessCompare.reset();
