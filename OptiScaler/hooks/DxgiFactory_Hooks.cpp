@@ -574,6 +574,9 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
               localDesc.BufferCount, localDesc.Flags, (SIZE_T) localDesc.OutputWindow, localDesc.Windowed,
               _skipFGSwapChainCreation);
 
+    if (!_skipFGSwapChainCreation)
+        FGHooks::ReleaseUnusableFGSwapchain(localDesc.OutputWindow, pDevice);
+
     if (UsesXeFGApi(State::Instance().activeFgOutput) && FGHooks::BorderlessForced())
     {
         // Nested call from the FG library is windowed, keep the outer request
@@ -1022,6 +1025,9 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
 
     if (pFullscreenDesc != nullptr)
         memcpy(&localFullscreenDesc, pFullscreenDesc, sizeof(DXGI_SWAP_CHAIN_FULLSCREEN_DESC));
+
+    if (!_skipFGSwapChainCreation)
+        FGHooks::ReleaseUnusableFGSwapchain(hWnd, pDevice);
 
     if (UsesXeFGApi(State::Instance().activeFgOutput) && FGHooks::BorderlessForced())
     {
@@ -1667,6 +1673,9 @@ HRESULT DxgiFactoryHooks::DLSSGCreateSwapChain(IDXGIFactory* realFactory, IUnkno
               localDesc.BufferCount, localDesc.Flags, (SIZE_T) localDesc.OutputWindow, localDesc.Windowed,
               _skipFGSwapChainCreation);
 
+    if (!_skipFGSwapChainCreation)
+        FGHooks::ReleaseUnusableFGSwapchain(localDesc.OutputWindow, pDevice);
+
     if (UsesXeFGApi(State::Instance().activeFgOutput) && FGHooks::BorderlessForced())
     {
         // Nested call from the FG library is windowed, keep the outer request
@@ -1974,6 +1983,9 @@ HRESULT DxgiFactoryHooks::DLSSGCreateSwapChainForHwnd(IDXGIFactory2* realFactory
 
     if (pFullscreenDesc != nullptr)
         memcpy(&localFullscreenDesc, pFullscreenDesc, sizeof(DXGI_SWAP_CHAIN_FULLSCREEN_DESC));
+
+    if (!_skipFGSwapChainCreation)
+        FGHooks::ReleaseUnusableFGSwapchain(hWnd, pDevice);
 
     if (UsesXeFGApi(State::Instance().activeFgOutput) && FGHooks::BorderlessForced())
     {

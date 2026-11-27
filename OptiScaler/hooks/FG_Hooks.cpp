@@ -259,6 +259,32 @@ bool FGHooks::IsOtherWindowThanFG(HWND hwnd)
     return true;
 }
 
+void FGHooks::ReleaseUnusableFGSwapchain(HWND hwnd, IUnknown* pDevice)
+{
+    auto swapchain = State::Instance().currentFGSwapchain;
+    if (swapchain == nullptr || _releasedFGSwapchain != swapchain || pDevice == nullptr)
+        return;
+
+    ID3D12CommandQueue* cq = nullptr;
+    if (pDevice->QueryInterface(IID_PPV_ARGS(&cq)) != S_OK)
+        return;
+
+    cq->Release();
+
+    IUnknown* queue = nullptr;
+    if (!Util::CheckForRealObject(__FUNCTION__, cq, &queue))
+        queue = cq;
+
+    if (hwnd == _hwnd && queue == currentCommandQueue)
+        return;
+
+    LOG_INFO("Releasing kept FG swapchain, window: {:X} -> {:X}, queue: {:X} -> {:X}", (size_t) _hwnd, (size_t) hwnd,
+             (size_t) currentCommandQueue, (size_t) queue);
+
+    // Other hooks can still hold its references
+    ReleaseFGSwapchain(swapchain, false);
+}
+
 void FGHooks::NoteGameFsrFgSeen() { State::Instance().gameFsrFgSeen = true; }
 
 void FGHooks::NoteGameFsrFg(bool on)
@@ -278,6 +304,30 @@ void FGHooks::NoteGameFsrFg(bool on)
         state.currentFG->ResetCounters();
     }
 }
+
+// Nested FG swapchain resizes would deadlock on the FG mutex
+static thread_local int resizeDepth = 0;
+
+struct ResizeScope
+{
+    std::optional<OwnedLockGuard> lock;
+
+    ResizeScope(IFGFeature_Dx12* fg, uint32_t owner)
+    {
+        // Owner 7 is a mode switch waiting for the window to handle this resize
+        if (resizeDepth++ == 0 && fg != nullptr && Config::Instance()->FGUseMutexForSwapchain.value_or_default() &&
+            !fg->Mutex.isLockedByThisThread() && !(fg->Mutex.getOwner() == 7 && InSendMessage()))
+        {
+            lock.emplace(fg->Mutex, owner);
+        }
+    }
+
+    ~ResizeScope()
+    {
+        lock.reset();
+        resizeDepth--;
+    }
+};
 
 static bool CheckForFGStatus()
 {
@@ -414,6 +464,16 @@ HRESULT FGHooks::CreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
 
         scResult = fg->CreateSwapchain(pFactory, cq, pDesc, ppSwapChain, true);
 
+        // Reusing failed, the kept swapchain still owns the window
+        if (!scResult && _releasedFGSwapchain != nullptr &&
+            _releasedFGSwapchain == State::Instance().currentFGSwapchain)
+        {
+            ReleaseFGSwapchain(State::Instance().currentFGSwapchain, false);
+
+            if (State::Instance().currentFGSwapchain == nullptr)
+                scResult = fg->CreateSwapchain(pFactory, cq, pDesc, ppSwapChain, true);
+        }
+
         // Taken after the create. XeFG and FSR-FG release a same-window swapchain in there and leave none
         // current, so the game's own Release of it goes through. Still current: one on another window (its
         // Releases stay skipped, so it leaks, as before), a preserved one, or DLSSG's (which frees it itself).
@@ -530,6 +590,16 @@ HRESULT FGHooks::CreateSwapChainForHwnd(IDXGIFactory* pFactory, IUnknown* pDevic
 
         scResult = fg->CreateSwapchain1(pFactory, cq, hWnd, pDesc, pFullscreenDesc, ppSwapChain, true);
 
+        // Reusing failed, the kept swapchain still owns the window
+        if (!scResult && _releasedFGSwapchain != nullptr &&
+            _releasedFGSwapchain == State::Instance().currentFGSwapchain)
+        {
+            ReleaseFGSwapchain(State::Instance().currentFGSwapchain, false);
+
+            if (State::Instance().currentFGSwapchain == nullptr)
+                scResult = fg->CreateSwapchain1(pFactory, cq, hWnd, pDesc, pFullscreenDesc, ppSwapChain, true);
+        }
+
         // Taken after the create. XeFG and FSR-FG release a same-window swapchain in there and leave none
         // current, so the game's own Release of it goes through. Still current: one on another window (its
         // Releases stay skipped, so it leaks, as before), a preserved one, or DLSSG's (which frees it itself).
@@ -569,7 +639,15 @@ void FGHooks::SetFGSwapchain(IDXGISwapChain* pSwapChain, HWND hWnd)
     if (pSwapChain == nullptr)
         return;
 
+    // References the FG library keeps, the game's last release leaves only these
+    if (pSwapChain != State::Instance().currentFGSwapchain)
+    {
+        pSwapChain->AddRef();
+        _fgSwapchainBaseRefs = pSwapChain->Release() - 1;
+    }
+
     _hwnd = hWnd;
+    _releasedFGSwapchain = nullptr;
 
     // Requested by the swapchain being created (not by another window's), applied now that it is the FG swapchain.
     // The HDR output's own keep (KeepBorderless) stays as it is.
@@ -1185,19 +1263,13 @@ HRESULT FGHooks::hkResizeBuffers(IDXGISwapChain* This, UINT BufferCount, UINT Wi
 
     State::Instance().SCLastFlags = SwapChainFlags;
 
+    ResizeScope lg(fgDx12, 6677);
+
     if (fg != nullptr && fg->IsActive())
     {
         State::Instance().fgChanged = true;
         fg->UpdateTarget();
         fg->Deactivate();
-
-        // Let's try Dx11 like approach on Dx12
-        std::shared_lock<std::shared_mutex> resizeLock(_resizeMutex, std::defer_lock);
-        if (UsesXeFGApi(State::Instance().activeFgOutput) &&
-            State::Instance().swapchainInteropApi == SwapchainInteropApi::None)
-        {
-            resizeLock.lock();
-        }
     }
 
     _skipResize1 = true;
@@ -1448,19 +1520,13 @@ HRESULT FGHooks::hkResizeBuffers1(IDXGISwapChain3* This, UINT BufferCount, UINT 
 
     State::Instance().SCLastFlags = SwapChainFlags;
 
+    ResizeScope lg(fgDx12, 6678);
+
     if (fg != nullptr && fg->IsActive())
     {
         State::Instance().fgChanged = true;
         fg->UpdateTarget();
         fg->Deactivate();
-
-        // Let's try Dx11 like approach on Dx12
-        std::shared_lock<std::shared_mutex> resizeLock(_resizeMutex, std::defer_lock);
-        if (UsesXeFGApi(State::Instance().activeFgOutput) &&
-            State::Instance().swapchainInteropApi == SwapchainInteropApi::None)
-        {
-            resizeLock.lock();
-        }
     }
 
     // Release menu render targets
@@ -1660,14 +1726,6 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
 
     if (willPresent)
     {
-        // Let's try Dx11 like approach on Dx12
-        std::shared_lock<std::shared_mutex> resizeLock(_resizeMutex, std::defer_lock);
-        if (UsesXeFGApi(State::Instance().activeFgOutput) &&
-            State::Instance().swapchainInteropApi == SwapchainInteropApi::None)
-        {
-            resizeLock.lock();
-        }
-
         state.fgLastFrame++;
 
         double ftDelta = 0.0f;
@@ -2069,9 +2127,7 @@ ULONG FGHooks::hkFGRelease(IUnknown* This)
     }
 #endif // (XEFG_RESOURCE_REF_LIMIT == 0)
 
-    static bool skipReleaseChecks = false;
-
-    if (skipReleaseChecks || State::Instance().currentFGSwapchain != This || State::Instance().isShuttingDown)
+    if (_skipReleaseChecks || State::Instance().currentFGSwapchain != This || State::Instance().isShuttingDown)
         return o_FGRelease(This);
 
     This->AddRef();
@@ -2080,108 +2136,136 @@ ULONG FGHooks::hkFGRelease(IUnknown* This)
     {
         if (o_FGRelease(This) == 1)
         {
-            LOG_DEBUG("");
-
-            if (State::Instance().currentCommandQueue != nullptr && resizeFence != nullptr &&
-                resizeFenceEvent != nullptr)
-            {
-                LOG_DEBUG("Waiting for GPU to finish");
-
-                const auto waitResult = WaitForQueueIdle(State::Instance().currentCommandQueue);
-
-                LOG_DEBUG("WaitForSingleObject result: {}", waitResult);
-            }
-
-            DXGI_SWAP_CHAIN_DESC scDesc {};
-            ((IDXGISwapChain*) This)->GetDesc(&scDesc);
-
-            // The loops below release references OptiScaler never took (a backbuffer down to one, the game's wrapped
-            // swapchain down to none). Next to a REFramework drawing on XeFG's frames those are REFramework's own, and it
-            // releases them again later: misc/REFrameworkCompat.h leaves both alone.
-            const bool onlyOwnReferences = REFrameworkCompat::Active();
-
-            if (onlyOwnReferences)
-                LOG_INFO("REFramework compatibility: FG swapchain released, other components' references left alone");
-
-            // Release swapchain backbuffers to prevent errors when releasing FG swapchain
-            if (!onlyOwnReferences)
-            {
-                for (UINT i = 0; i < scDesc.BufferCount; i++)
-                {
-                    ID3D12Resource* backBuffer = nullptr;
-                    auto bbResult = ((IDXGISwapChain*) This)->GetBuffer(i, IID_PPV_ARGS(&backBuffer));
-
-                    if (bbResult == S_OK)
-                    {
-                        LOG_DEBUG("Backbuffer {}: {:X}", i, (size_t) backBuffer);
-                        auto refCount = backBuffer->Release();
-                        while (refCount > XEFG_RESOURCE_REF_LIMIT)
-                        {
-                            LOG_DEBUG("Releasing backbuffer {}: RefCount {}", i, refCount);
-                            refCount = backBuffer->Release();
-                        }
-
-#if (XEFG_RESOURCE_REF_LIMIT == 0)
-                        oldBackBuffers.push_back(backBuffer);
-#endif
-                    }
-                    else
-                    {
-                        LOG_DEBUG("GetBuffer failed for index {}: {:X}", i, (UINT) bbResult);
-                        break;
-                    }
-                }
-            }
-
-            // To prevent deadlock when FG release the swapchain
-            skipReleaseChecks = true;
-
-            if (State::Instance().currentFG != nullptr)
-            {
-                LOG_DEBUG("FG Swapchain released, release FG & swapchain context");
-                State::Instance().currentFG->ReleaseSwapchain(_hwnd);
-            }
-
-            LOG_DEBUG("FG Swapchain released, clearing currentFGSwapchain");
-            State::Instance().currentFGSwapchain = nullptr;
-
-            // The queue goes with the swapchain, holding it would keep the game's device alive
-            SetCurrentCommandQueue(nullptr);
-
-            // The emulated full screen went with it (HDR output's own keep is released by its owner)
-            if (!_hdrKeeper.Active())
-                State::Instance().SCExclusiveFullscreen = false;
-
-            if (State::Instance().currentSwapchain == This)
-                State::Instance().currentSwapchain = nullptr;
-
-            // currentWrappedSwapchain is the game's swapchain, held by the game: kept, as it is still alive
-            if (!onlyOwnReferences && State::Instance().currentWrappedSwapchain != nullptr &&
-                State::Instance().currentSwapchainDesc.OutputWindow == _hwnd)
-            {
-                auto refCount = State::Instance().currentWrappedSwapchain->Release();
-
-                while (refCount > 0 && refCount < 0xffffff00)
-                {
-                    refCount = State::Instance().currentWrappedSwapchain->Release();
-                }
-
-                State::Instance().currentWrappedSwapchain = nullptr;
-            }
-
-            skipReleaseChecks = false;
-
+            ReleaseFGSwapchain(This, true);
             return 0;
         }
     }
     else
     {
-        if (o_FGRelease(This) == 1)
+        auto refCount = o_FGRelease(This);
+
+        // Only FSR FG and XeFG release the kept swapchain with their swapchain context
+        const bool canRelease =
+            State::Instance().activeFgOutput == FGOutput::FSRFG || UsesXeFGApi(State::Instance().activeFgOutput);
+
+        if (refCount == 1)
         {
             LOG_INFO("Preserving FG Swapchain from release");
+            _releasedFGSwapchain = canRelease ? This : nullptr;
+            _fgSwapchainBaseRefs = 1;
             return 0;
         }
+
+        // Only the FG library's own references are left
+        if (canRelease && refCount - 1 == _fgSwapchainBaseRefs)
+            _releasedFGSwapchain = This;
     }
 
     return o_FGRelease(This);
+}
+
+// releaseReferences: the game's last reference went (the loops below take the references OptiScaler never took);
+// false: a kept swapchain the game dropped earlier, only the FG library's references are left
+void FGHooks::ReleaseFGSwapchain(IUnknown* swapchain, bool releaseReferences)
+{
+    LOG_DEBUG("");
+
+    if (State::Instance().currentCommandQueue != nullptr && resizeFence != nullptr && resizeFenceEvent != nullptr)
+    {
+        LOG_DEBUG("Waiting for GPU to finish");
+
+        const auto waitResult = WaitForQueueIdle(State::Instance().currentCommandQueue);
+
+        LOG_DEBUG("WaitForSingleObject result: {}", waitResult);
+    }
+
+    // The loops below release references OptiScaler never took (a backbuffer down to one, the game's wrapped
+    // swapchain down to none). Next to a REFramework drawing on XeFG's frames those are REFramework's own, and it
+    // releases them again later: misc/REFrameworkCompat.h leaves both alone.
+    const bool onlyOwnReferences = releaseReferences && REFrameworkCompat::Active();
+
+    if (onlyOwnReferences)
+        LOG_INFO("REFramework compatibility: FG swapchain released, other components' references left alone");
+
+    // Release swapchain backbuffers to prevent errors when releasing FG swapchain
+    if (releaseReferences && !onlyOwnReferences)
+    {
+        DXGI_SWAP_CHAIN_DESC scDesc {};
+        ((IDXGISwapChain*) swapchain)->GetDesc(&scDesc);
+
+        for (UINT i = 0; i < scDesc.BufferCount; i++)
+        {
+            ID3D12Resource* backBuffer = nullptr;
+            auto bbResult = ((IDXGISwapChain*) swapchain)->GetBuffer(i, IID_PPV_ARGS(&backBuffer));
+
+            if (bbResult == S_OK)
+            {
+                LOG_DEBUG("Backbuffer {}: {:X}", i, (size_t) backBuffer);
+                auto refCount = backBuffer->Release();
+                while (refCount > XEFG_RESOURCE_REF_LIMIT)
+                {
+                    LOG_DEBUG("Releasing backbuffer {}: RefCount {}", i, refCount);
+                    refCount = backBuffer->Release();
+                }
+
+#if (XEFG_RESOURCE_REF_LIMIT == 0)
+                oldBackBuffers.push_back(backBuffer);
+#endif
+            }
+            else
+            {
+                LOG_DEBUG("GetBuffer failed for index {}: {:X}", i, (UINT) bbResult);
+                break;
+            }
+        }
+    }
+
+    // To prevent deadlock when FG release the swapchain
+    _skipReleaseChecks = true;
+
+    if (State::Instance().currentFG != nullptr)
+    {
+        LOG_DEBUG("FG Swapchain released, release FG & swapchain context");
+        State::Instance().currentFG->ReleaseSwapchain(_hwnd);
+    }
+
+    // A kept swapchain stays tracked when the FG library couldn't release it (XeFG parks a refused context and
+    // retries it, framegen/xefg)
+    if (!releaseReferences && State::Instance().currentFG != nullptr &&
+        State::Instance().currentFG->SwapchainContext() != nullptr)
+    {
+        LOG_WARN("Kept FG swapchain couldn't be released");
+        _skipReleaseChecks = false;
+        return;
+    }
+
+    LOG_DEBUG("FG Swapchain released, clearing currentFGSwapchain");
+    State::Instance().currentFGSwapchain = nullptr;
+    _releasedFGSwapchain = nullptr;
+
+    // The queue goes with the swapchain, holding it would keep the game's device alive
+    SetCurrentCommandQueue(nullptr);
+
+    // The emulated full screen went with it (HDR output's own keep is released by its owner)
+    if (!_hdrKeeper.Active())
+        State::Instance().SCExclusiveFullscreen = false;
+
+    if (State::Instance().currentSwapchain == swapchain)
+        State::Instance().currentSwapchain = nullptr;
+
+    // currentWrappedSwapchain is the game's swapchain, held by the game: kept, as it is still alive
+    if (releaseReferences && !onlyOwnReferences && State::Instance().currentWrappedSwapchain != nullptr &&
+        State::Instance().currentSwapchainDesc.OutputWindow == _hwnd)
+    {
+        auto refCount = State::Instance().currentWrappedSwapchain->Release();
+
+        while (refCount > 0 && refCount < 0xffffff00)
+        {
+            refCount = State::Instance().currentWrappedSwapchain->Release();
+        }
+
+        State::Instance().currentWrappedSwapchain = nullptr;
+    }
+
+    _skipReleaseChecks = false;
 }
