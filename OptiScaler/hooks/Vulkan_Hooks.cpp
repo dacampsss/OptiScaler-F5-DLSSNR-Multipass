@@ -757,9 +757,10 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
 
     if (!ScopedSkipVulkanHooks::Active() && !D3DOnVulkanModule(Util::GetCallerModule(_ReturnAddress())) &&
         !VkPresentBridge::DxvkGame() && !VkPresentBridge::ModeWantsBridge() && !StreamlineProxy::IsInitializing() &&
-        // No D3D12 device made in the process: since 2db37a74 a device only becomes currentD3D12Device with the game's
-        // swapchain, so the list (filled at device creation) keeps this decision as it was before that change
-        State::Instance().d3d12Devices.empty() && (nativeFg = CreateFGFeature()) != nullptr)
+        // No live D3D12 device in the process: since 2db37a74 a device only becomes currentD3D12Device with the game's
+        // swapchain, so the list (added at device creation, removed when the device's last reference goes) keeps this
+        // decision as it was before that change
+        !State::Instance().HasD3D12Devices() && (nativeFg = CreateFGFeature()) != nullptr)
     {
         if (EnableTimelineSemaphores(physicalDevice, localCreteInfo, nativeFgTimeline))
         {

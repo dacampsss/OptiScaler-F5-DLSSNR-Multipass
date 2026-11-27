@@ -154,8 +154,7 @@ static HRESULT hkD3D11On12CreateDevice(IUnknown* pDevice, UINT Flags, const D3D_
                                          ppImmediateContext, pChosenFeatureLevel);
     }
 
-    if (result == S_OK && ppDevice != nullptr && *ppDevice != nullptr && !rtss &&
-        State::Instance().d3d12Devices.empty())
+    if (result == S_OK && ppDevice != nullptr && *ppDevice != nullptr && !rtss && !State::Instance().HasD3D12Devices())
     {
         LOG_INFO("Device captured, D3D11Device: {0:X}", (UINT64) *ppDevice);
         HookToDeviceLocal(*ppDevice);
@@ -267,7 +266,7 @@ static HRESULT hkD3D11CreateDevice(IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE Drive
 
     _skipDx11Create = false;
 
-    if (result == S_OK && ppDevice != nullptr && *ppDevice != nullptr && State::Instance().d3d12Devices.empty())
+    if (result == S_OK && ppDevice != nullptr && *ppDevice != nullptr && !State::Instance().HasD3D12Devices())
     {
         LOG_INFO("Device captured");
         HookToDeviceLocal(*ppDevice);
@@ -466,7 +465,7 @@ static HRESULT hkD3D11CreateDeviceAndSwapChain(IDXGIAdapter* pAdapter, D3D_DRIVE
     _skipDx11Create = false;
 
     if (SUCCEEDED(result) && !otherWindow && ppDevice != nullptr && *ppDevice != nullptr &&
-        State::Instance().d3d12Devices.empty())
+        !State::Instance().HasD3D12Devices())
     {
         LOG_INFO("Device captured");
         HookToDeviceLocal(*ppDevice);

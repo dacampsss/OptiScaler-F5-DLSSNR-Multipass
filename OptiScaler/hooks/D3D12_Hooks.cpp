@@ -1518,7 +1518,7 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
         HookToDevice(createdDevice);
         _d3d12Captured = true;
 
-        State::Instance().d3d12Devices.push_back((ID3D12Device*) *ppDevice);
+        State::Instance().AddD3D12Device((ID3D12Device*) *ppDevice);
 
 #ifdef ENABLE_DEBUG_LAYER_DX12
         if (infoQueue != nullptr)
@@ -1648,7 +1648,7 @@ static HRESULT hkCreateDevice(ID3D12DeviceFactory* pFactory, IUnknown* pAdapter,
         HookToDevice(createdDevice);
         _d3d12Captured = true;
 
-        State::Instance().d3d12Devices.push_back((ID3D12Device*) *ppDevice);
+        State::Instance().AddD3D12Device((ID3D12Device*) *ppDevice);
 
 #ifdef ENABLE_DEBUG_LAYER_DX12
         if (infoQueue != nullptr)
@@ -1717,16 +1717,25 @@ static ULONG hkD3D12DeviceRelease(IUnknown* device)
         o_D3D12DeviceRelease(device);
     }
 
-    if (State::Instance().currentD3D12Device == device)
+    // Any device we track (not only the game's current one): a probe device made and dropped by a launcher must
+    // leave the list, or the "no D3D12 device in the process" decisions stay false for the whole session
+    const bool isCurrent = State::Instance().currentD3D12Device == device;
+
+    if (isCurrent || State::Instance().ContainsD3D12Device(device))
     {
         device->AddRef();
         auto refCount = o_D3D12DeviceRelease(device);
 
         if (refCount == 1)
         {
-            LOG_DEBUG("Set State::Instance().currentD3D12Device = nullptr, was: {:X}", (size_t) device);
-            State::Instance().currentD3D12Device = nullptr;
-            native::lowlatency::OnDeviceReleased(device);
+            State::Instance().RemoveD3D12Device((ID3D12Device*) device);
+
+            if (isCurrent)
+            {
+                LOG_DEBUG("Set State::Instance().currentD3D12Device = nullptr, was: {:X}", (size_t) device);
+                State::Instance().currentD3D12Device = nullptr;
+                native::lowlatency::OnDeviceReleased(device);
+            }
         }
     }
 

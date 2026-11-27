@@ -13,6 +13,7 @@
 
 #include <set>
 #include <deque>
+#include <algorithm>
 #include <mutex>
 #include <atomic>
 #include <sl_dlss_g.h>
@@ -464,7 +465,43 @@ class State
     VkDevice currentVkDevice = nullptr;
     DXGI_SWAP_CHAIN_DESC currentSwapchainDesc {};
 
-    std::vector<ID3D12Device*> d3d12Devices;
+    // D3D12 devices that are alive: added at creation, removed when the last reference goes (hkD3D12DeviceRelease).
+    // Devices are created and destroyed on any thread, so every access goes through these helpers.
+    void AddD3D12Device(ID3D12Device* device)
+    {
+        std::lock_guard<std::mutex> lock(_d3d12DevicesMutex);
+        _d3d12Devices.push_back(device);
+    }
+
+    void RemoveD3D12Device(ID3D12Device* device)
+    {
+        std::lock_guard<std::mutex> lock(_d3d12DevicesMutex);
+        _d3d12Devices.erase(std::remove(_d3d12Devices.begin(), _d3d12Devices.end(), device), _d3d12Devices.end());
+    }
+
+    bool HasD3D12Devices()
+    {
+        std::lock_guard<std::mutex> lock(_d3d12DevicesMutex);
+        return !_d3d12Devices.empty();
+    }
+
+    bool ContainsD3D12Device(const void* device)
+    {
+        std::lock_guard<std::mutex> lock(_d3d12DevicesMutex);
+        return std::find(_d3d12Devices.begin(), _d3d12Devices.end(), device) != _d3d12Devices.end();
+    }
+
+    // The most recently created live device, or nullptr
+    ID3D12Device* LastD3D12Device()
+    {
+        std::lock_guard<std::mutex> lock(_d3d12DevicesMutex);
+        return _d3d12Devices.empty() ? nullptr : _d3d12Devices.back();
+    }
+
+    // use the helpers above, not these
+    std::mutex _d3d12DevicesMutex;
+    std::vector<ID3D12Device*> _d3d12Devices;
+
     std::vector<ID3D11Device*> d3d11Devices;
 
     // The FG output of whichever API the game uses
