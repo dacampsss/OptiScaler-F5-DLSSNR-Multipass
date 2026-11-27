@@ -5966,6 +5966,23 @@ void RenderF5LutCard(Config* config, float menuResScale)
         RenderPostLutSection(config);
 }
 
+void RenderInputLutCard(Config* config, float menuResScale)
+{
+    const bool lutOn = config->DlssNrLutSource.value_or_default() == 1u ||
+                       !config->DlssNrLutFile.value_or_default().empty() ||
+                       !DlssNr::IsNeutralCustomLut({ config->DlssNrLutExposure.value_or_default(),
+                                                     config->DlssNrLutBrightness.value_or_default(),
+                                                     config->DlssNrLutGamma.value_or_default(),
+                                                     config->DlssNrLutBlacks.value_or_default(),
+                                                     config->DlssNrLutWhites.value_or_default(),
+                                                     config->DlssNrLutContrast.value_or_default(),
+                                                     config->DlssNrLutTemperature.value_or_default(),
+                                                     config->DlssNrLutSaturation.value_or_default() });
+
+    if (NrCard card("Input LUT##card", menuResScale, lutOn); card.IsOpen())
+        RenderLutSection(config);
+}
+
 void RenderMenu(Config* config, float menuResScale, MenuPages::Page page)
 {
     using MenuPages::Page;
