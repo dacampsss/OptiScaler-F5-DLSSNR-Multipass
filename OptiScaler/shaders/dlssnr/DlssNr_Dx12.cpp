@@ -44,6 +44,7 @@
 #include <dlssnr/DlssNr_ColourEncodingStatus.h>
 #include <dlssnr/DlssNr_LutPack.h>
 #include <dlssnr/DlssNr_LutStatus.h>
+#include <dlssnr/DlssNr_LutCustom.h>
 #include "DlssNr_FollowGame.h"
 #include "DlssNr_ExposureCalibrate.h"
 #include "DlssNr_ExposureCalibrate_Run.h"
@@ -3183,11 +3184,55 @@ bool DlssNr_Dx12::EnsureLutTextureFrom(ID3D12GraphicsCommandList* InCmdList, con
     return true;
 }
 
+bool DlssNr_Dx12::EnsureLutState(ID3D12GraphicsCommandList* InCmdList, const Config* cfg)
+{
+    if (cfg == nullptr)
+        return false;
+
+    const bool useCustom = cfg->DlssNrLutSource.value_or_default() == 1u;
+    if (useCustom)
+    {
+        DlssNr::CustomLutParams p;
+        p.exposure = cfg->DlssNrLutExposure.value_or_default();
+        p.brightness = cfg->DlssNrLutBrightness.value_or_default();
+        p.gamma = cfg->DlssNrLutGamma.value_or_default();
+        p.blacks = cfg->DlssNrLutBlacks.value_or_default();
+        p.whites = cfg->DlssNrLutWhites.value_or_default();
+        p.contrast = cfg->DlssNrLutContrast.value_or_default();
+        p.temperature = cfg->DlssNrLutTemperature.value_or_default();
+        p.saturation = cfg->DlssNrLutSaturation.value_or_default();
+
+        if (DlssNr::IsNeutralCustomLut(p))
+        {
+            _lutState = DlssNr_LutState();
+            return false;
+        }
+
+        DlssNr_LutEnsureCustom(&_lutState, p);
+    }
+    else
+    {
+        DlssNr_LutEnsureParsed(&_lutState, cfg->DlssNrLutFile.value_or_default());
+    }
+
+    if (!_lutState.Loaded())
+        return false;
+
+    if (!LutPipelineReady())
+        return false;
+
+    return EnsureLutTexture(InCmdList);
+}
+
 bool DlssNr_Dx12::DispatchLut(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InSource, ID3D12Resource* OutTarget,
                               unsigned int Width, unsigned int Height, float Strength, uint32_t InputEncoding,
                               bool ColourIsLinearHdr, const DlssNrConstants& White, ID3D12Resource* ExposureTex,
                               const std::string& LutPath)
 {
+    Config* cfg = Config::Instance();
+    if (cfg != nullptr && cfg->DlssNrLutSource.value_or_default() == 1u)
+        return false;
+
     DlssNr_LutEnsureParsed(&_lutState, LutPath);
 
     if (!_lutState.Loaded())
@@ -5116,27 +5161,33 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         FillExposureConstants(params, cfg, usingAutoExposure ? 3u : 1u, frame.PreExposure);
     };
 
-    // LUT-apply epic (dlssnr-lut-apply), Story 2: grade `target` through a
-    // loaded .cube file before the model sees it. After the white point is resolved above (it grades for that
-    // white), and deliberately AFTER the crop and the
-    // exposure measurement above that, not right after g_gpuTime->Start where Story 2 originally put
-    // it -- that measured the LUT's own graded output as if it were the clean upscaler frame, repeating
-    // (from a different angle) the exact mistake the Automatic-exposure meter's own comment above warns
-    // about ("nothing this pass writes is measured"). A nonlinear grade shifts apparent scene brightness
-    // by a different, content-dependent amount per scene, so the symptom wasn't a fixed bias but
-    // exposure needing a different correction shot to shot (found 2026-10-04, user report). Grading
-    // here instead means the meter and crop both still see the clean frame, exactly as they did before
-    // this epic existed; only the model and everything after it see the grade. Writes back onto
-    // `target` itself (via lutScratch and a GPU copy) rather than reassigning the pointer, so codec,
-    // model and resolve all still run exactly as they did before the epic existed, LUT loaded or not.
+    // Input LUT (.cube file) graded onto `target` before the model sees it. Custom realtime adjustments are
+    // applied later as post-processing on the final image.
+    const bool useCustomLut = cfg.DlssNrLutSource.value_or_default() == 1u;
+    DlssNr::CustomLutParams customLutParams {};
+    if (useCustomLut)
+    {
+        customLutParams.exposure = cfg.DlssNrLutExposure.value_or_default();
+        customLutParams.brightness = cfg.DlssNrLutBrightness.value_or_default();
+        customLutParams.gamma = cfg.DlssNrLutGamma.value_or_default();
+        customLutParams.blacks = cfg.DlssNrLutBlacks.value_or_default();
+        customLutParams.whites = cfg.DlssNrLutWhites.value_or_default();
+        customLutParams.contrast = cfg.DlssNrLutContrast.value_or_default();
+        customLutParams.temperature = cfg.DlssNrLutTemperature.value_or_default();
+        customLutParams.saturation = cfg.DlssNrLutSaturation.value_or_default();
+    }
+    const bool customLutWanted = useCustomLut && !DlssNr::IsNeutralCustomLut(customLutParams);
+
     const auto postLutEntries = DlssNr::PostLutEntries(cfg);
-    const bool postLutWanted = std::any_of(postLutEntries.begin(), postLutEntries.end(),
+    const bool postLutWanted = customLutWanted ||
+                               std::any_of(postLutEntries.begin(), postLutEntries.end(),
                                            [](const DlssNr::ChainEntry& e) { return !e.path.empty(); });
 
     {
-        const std::string lutPath = cfg.DlssNrLutFile.value_or_default();
+        const std::string lutPath = useCustomLut ? std::string("<custom>") : cfg.DlssNrLutFile.value_or_default();
+        const bool lutWanted = !useCustomLut && !lutPath.empty();
 
-        if (!lutPath.empty())
+        if (lutWanted)
         {
             // Copied back onto `target` (CopyTextureRegion): exact format
             if (g_nr.lutScratch != nullptr && g_nr.lutScratch->GetDesc().Format != desc.Format)
@@ -5165,26 +5216,22 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                 TransitionTarget(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
                 const float lutStrength = std::clamp(cfg.DlssNrLutStrength.value_or_default(), 0.0f, 1.0f);
-                // The white point the encode below uses, so a linear HDR frame lands in the LUT's 0-1 domain where the
-                // model's own proxy puts it. Not AutoTrimEffective: that is only the Trim on top of the base white point,
-                // and a game whose frame is scaled by its exposure (RDR2: paper white ~1700x) would otherwise be seen
-                // as ~1000x over white -- the whole picture pinned at the top of the curve. With the encode's live
-                // fields and texture, so where the encode recomputes it this frame the LUT does too (it used to take
-                // the host value, 3-4 frames old, made for a different white than the model was shown).
                 DlssNrConstants lutWhite {};
                 fillLiveWhitePoint(lutWhite);
-                const bool graded =
-                    DispatchLut(cmdList, target, g_nr.lutScratch, width, height, lutStrength, frame.InputEncoding,
-                                isHdrBuffer, lutWhite, exposureTex, lutPath);
+                bool graded = false;
+                if (EnsureLutState(cmdList, &cfg))
+                {
+                    graded = DispatchLutWith(cmdList, target, g_nr.lutScratch, width, height, lutStrength,
+                                             frame.InputEncoding, isHdrBuffer, lutWhite, exposureTex, _lutState.lut,
+                                             _lutTexture);
+                }
 
                 DlssNr::ReportLutStatus(true, _lutState.loadedPath, _lutState.lut.size, _lutState.failed,
-                                        _lutState.error, _lutState.attemptedPath, lutStrength);
+                                        _lutState.error, _lutState.attemptedPath.empty() ? lutPath : _lutState.attemptedPath,
+                                        lutStrength);
 
                 if (graded)
                 {
-                    // Copy the graded scratch back onto `target` itself: nothing after this point needs to
-                    // know a LUT ran, including the model dispatch ahead, which otherwise has no idea its
-                    // own source (`target`) might be aliased to a texture it does not own.
                     TransitionTarget(D3D12_RESOURCE_STATE_COPY_DEST);
                     Barrier(cmdList, g_nr.lutScratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                             D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -5193,28 +5240,17 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 }
 
-                // Parsed-but-unusable (a malformed file) or the pipeline failed to build takes the same path
-                // back: restore exactly the state target was in before this block touched it.
                 TransitionTarget(priorTargetState);
             }
         }
         else
         {
-            // LutFile was cleared: neither the scratch target nor the uploaded 3D texture (up to ~16 MB for
-            // a 128^3 lattice) is reused by anything else, so there is no reason to keep holding either --
-            // the same hold-only-while-wanted discipline activeColor's own scratch follows for cropColor.
-            // Fixed (Review Pass, 2026-10-04): this used to park only the scratch target, so _lutTexture
-            // stayed resident for the rest of the session once any LUT had ever loaded. A no-op once
-            // already released/parked.
-            // The post-NR stack shares the scratch, so it stays while that stack wants it.
             if (!postLutWanted)
-            {
                 ParkNrResource(g_nr.lutScratch);
-            }
-            // Also when making the scratch failed after its old format moved to the spare
             if (!postLutWanted)
                 ParkNrResource(g_nr.lutScratchSpare);
             ReleaseLutTexture();
+            _lutState = DlssNr_LutState();
             DlssNr::ReportLutStatus(false, "", 0, false, "", "", cfg.DlssNrLutStrength.value_or_default());
         }
     }
@@ -6892,11 +6928,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
 
-    // The post-NR LUT stack (memory/plans/2026-10-31-nr-lut-chain.md): grades NR's returned picture, which the model
-    // never sees, so it cannot move the exposure meter, skin detection or reuse. Same scratch / dispatch / copy-back as
-    // the Inputs LUT above, with the same white point so a linear HDR frame lands in the LUT's 0-1 domain the same way.
-    // Only on a frame NR composed: a failed evaluation leaves the game's own image untouched. In Finished Picture mode
-    // this is the picture at the present seam, so the grade lands on it as it is shown.
+    // Post-processing LUT: grades the final image. Applied after NR compose; also applied on finished-picture-only
+    // / non-composed frames when desired, as it does not depend on NR internals.
     {
         DlssNr::PostLutStatus status;
         status.wanted = postLutWanted;
@@ -6905,13 +6938,12 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         if (!postLutWanted)
         {
             ReleasePostLut();
-            if (g_nr.lutScratch != nullptr && cfg.DlssNrLutFile.value_or_default().empty())
+            if (g_nr.lutScratch != nullptr && !(!useCustomLut && !cfg.DlssNrLutFile.value_or_default().empty()))
                 ParkNrResource(g_nr.lutScratch);
-            // Also when making the scratch failed after its old format moved to the spare
-            if (cfg.DlssNrLutFile.value_or_default().empty())
+            if (!useCustomLut && cfg.DlssNrLutFile.value_or_default().empty())
                 ParkNrResource(g_nr.lutScratchSpare);
         }
-        else if (composed)
+        else
         {
             if (g_nr.lutScratch != nullptr && g_nr.lutScratch->GetDesc().Format != desc.Format)
             {
@@ -6925,7 +6957,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                 g_nr.lutScratchFailed = g_nr.lutScratch == nullptr;
 
                 if (g_nr.lutScratchFailed)
-                    LOG_ERROR("DLSS-NR: could not allocate the LUT pass's scratch target; the post-NR LUT is ignored");
+                    LOG_ERROR("DLSS-NR: could not allocate the LUT pass's scratch target; post LUT is ignored");
             }
 
             if (g_nr.lutScratch != nullptr)
@@ -6935,8 +6967,31 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
                 DlssNrConstants lutWhite {};
                 fillLiveWhitePoint(lutWhite);
-                graded = DispatchPostLut(cmdList, target, g_nr.lutScratch, width, height, frame.InputEncoding,
-                                         isHdrBuffer, lutWhite, exposureTex, postLutEntries);
+                if (customLutWanted)
+                {
+                    if (EnsureLutState(cmdList, &cfg))
+                    {
+                        graded = DispatchLutWith(cmdList, target, g_nr.lutScratch, width, height,
+                                                 std::clamp(cfg.DlssNrLutStrength.value_or_default(), 0.0f, 1.0f),
+                                                 frame.InputEncoding, isHdrBuffer, lutWhite, exposureTex, _lutState.lut,
+                                                 _lutTexture);
+                        if (graded)
+                        {
+                            status.loaded = true;
+                            status.chain = "<custom adjustments>";
+                        }
+                    }
+                    if (_lutState.failed)
+                    {
+                        status.failedPath = "<custom>";
+                        status.error = _lutState.error;
+                    }
+                }
+                else
+                {
+                    graded = DispatchPostLut(cmdList, target, g_nr.lutScratch, width, height, frame.InputEncoding,
+                                             isHdrBuffer, lutWhite, exposureTex, postLutEntries);
+                }
 
                 if (graded)
                 {
@@ -6954,24 +7009,27 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                 status.error = "could not allocate the scratch target";
         }
 
-        // A frame NR did not compose says nothing new: the last report stands.
-        if (!postLutWanted || composed)
+        if (!postLutWanted || !customLutWanted)
         {
             const DlssNr_LutChainState& chain = PostLut();
-            status.loaded = graded && chain.Loaded();
-            status.chain = chain.description;
-            static_assert(std::size(decltype(status.inputs) {}) == DlssNr::kMaxLutChainLayers);
-            std::copy(std::begin(chain.inputs), std::end(chain.inputs), status.inputs);
-            status.endsIn = chain.endsIn;
-            if (postLutWanted && !chain.error.empty())
+            if (!customLutWanted)
+            {
+                status.loaded = graded && chain.Loaded();
+                status.chain = chain.description;
+                static_assert(std::size(decltype(status.inputs) {}) == DlssNr::kMaxLutChainLayers);
+                std::copy(std::begin(chain.inputs), std::end(chain.inputs), status.inputs);
+                status.endsIn = chain.endsIn;
+            }
+            if (postLutWanted && !chain.error.empty() && !customLutWanted)
             {
                 status.failedPath = chain.failedLayer >= 0 ? chain.failedPath : std::string();
                 status.error = chain.error;
             }
-            if (status.loaded && frame.FinishedPicture)
-                status.note = "Graded on the finished picture (Finished Picture mode).";
-            DlssNr::ReportPostLutStatus(status);
         }
+
+        if (status.loaded && frame.FinishedPicture)
+            status.note = "Graded on the finished picture (Finished Picture mode).";
+        DlssNr::ReportPostLutStatus(status);
     }
 
     // Failed evaluations leave the game's original image intact. A successful copy-back writes
