@@ -22,6 +22,7 @@
 #include <low_latency/input/input_common.h>
 
 #include <misc/FrameLimit.h>
+#include <misc/DeferredRelease.h>
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -595,6 +596,10 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 
         native::lowlatency::OnDxvkGamePresentEnd(lowLatencyScope, presentResult);
 
+        // dxvk's Vulkan presents are not counted (hkvkQueuePresentKHR), this one is its frame
+        if (willPresent)
+            DeferredRelease::Process();
+
         if (presentResult == S_OK)
         {
             // DXVK returns below before the native path advances the NR epoch.
@@ -762,6 +767,10 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         presentResult = pSwapChain->Present(SyncInterval, Flags);
     else
         presentResult = ((IDXGISwapChain1*) pSwapChain)->Present1(SyncInterval, Flags, pPresentParameters);
+
+    // A DXGI_PRESENT_TEST is not a frame
+    if (willPresent)
+        DeferredRelease::Process();
 
     if (xefgPresent)
         InputCommon::fg_output_present(cq, true);

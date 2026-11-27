@@ -5,6 +5,7 @@
 
 #include <hudfix/Hudfix_Dx12.h>
 #include <menu/menu_overlay_dx.h>
+#include <misc/DeferredRelease.h>
 
 #include <magic_enum.hpp>
 
@@ -683,6 +684,9 @@ ffxReturnCode_t FSRFG_Dx12::DispatchCallback(ffxDispatchDescFrameGeneration* par
         }
     }
 
+    // Guards what the callback uses against ReleaseResourceCopies
+    std::unique_lock<std::mutex> callbackLock(_callbackResourceMutex);
+
     bool applyHudCutoff = Config::Instance()->FGHudCutoff.value_or_default() > 0.0f ||
                           State::Instance().gameQuirks & GameQuirk::FSRFGHudlessMismatchFixup;
 
@@ -725,12 +729,12 @@ ffxReturnCode_t FSRFG_Dx12::DispatchCallback(ffxDispatchDescFrameGeneration* par
 
             if (applyHudCutoff)
             {
-                if (_hudCopy[fIndex].get() == nullptr && callbackDevice != nullptr)
+                if (_hudCopy.get() == nullptr && callbackDevice != nullptr)
                 {
-                    _hudCopy[fIndex] = std::make_unique<HudCopy_Dx12>("HudCopy", callbackDevice);
+                    _hudCopy = std::make_unique<HudCopy_Dx12>("HudCopy", callbackDevice);
                 }
 
-                if (auto hudCopy = _hudCopy[fIndex].get(); hudCopy && hudCopy->IsInit())
+                if (auto hudCopy = _hudCopy.get(); hudCopy && hudCopy->IsInit())
                 {
                     // In Cyberprank - DLSSG has noise issues, FSR FG has noise + vignetting
                     // In Death Stranding 2 - DLSSG has wrong colormapping it seems, FSR FG is fine
@@ -753,15 +757,14 @@ ffxReturnCode_t FSRFG_Dx12::DispatchCallback(ffxDispatchDescFrameGeneration* par
             {
                 if (hudlessResource != nullptr)
                 {
-                    if (_hudlessCompareCompute[fIndex].get() == nullptr && callbackDevice != nullptr)
+                    if (_hudlessCompareCompute.get() == nullptr && callbackDevice != nullptr)
                     {
                         LOG_DEBUG("Creating HudlessCompareCompute on callback device {:X} (cached {:X})",
                                   (size_t) callbackDevice, (size_t) _device);
-                        _hudlessCompareCompute[fIndex] =
-                            std::make_unique<HCC_Dx12>("HudlessCompareCompute", callbackDevice);
+                        _hudlessCompareCompute = std::make_unique<HCC_Dx12>("HudlessCompareCompute", callbackDevice);
                     }
 
-                    if (auto hudlessCompareCompute = _hudlessCompareCompute[fIndex].get();
+                    if (auto hudlessCompareCompute = _hudlessCompareCompute.get();
                         hudlessCompareCompute && hudlessCompareCompute->IsInit())
                     {
                         hudlessCompareCompute->Dispatch(
@@ -774,6 +777,8 @@ ffxReturnCode_t FSRFG_Dx12::DispatchCallback(ffxDispatchDescFrameGeneration* par
             SAFE_RELEASE(callbackDevice);
         }
     }
+
+    callbackLock.unlock();
 
     auto dispatchResult = FfxApiProxy::D3D12_Dispatch(&_fgContext, &params->header);
     LOG_DEBUG("D3D12_Dispatch result: {}, fIndex: {}", (UINT) dispatchResult, fIndex);
@@ -1378,6 +1383,8 @@ void FSRFG_Dx12::EvaluateState(ID3D12Device* device, FG_Constants& fgConstants)
             Hudfix_Dx12::ResetCounters();
         }
 
+        ReleaseResourceCopies();
+
         // The change flags are cleared below, so a pending recreation (e.g. FFX FG version) must happen now
         if (State::Instance().scChanged)
             DestroyFGContext();
@@ -1406,9 +1413,6 @@ void FSRFG_Dx12::ReleaseObjects()
 {
     for (size_t i = 0; i < BUFFER_COUNT; i++)
     {
-        _hudCopy[i].reset();
-        _hudlessCompareCompute[i].reset();
-
         // The GPU can still be executing them
         Util::DelayedReleaseClear(_fgCommandAllocator[i]);
         Util::DelayedReleaseClear(_fgCommandList[i]);
@@ -1431,6 +1435,26 @@ void FSRFG_Dx12::ReleaseObjects()
     _hudlessCompare.reset();
     _mvFlip.reset();
     _depthFlip.reset();
+
+    ReleaseResourceCopies();
+}
+
+void FSRFG_Dx12::ReleaseResourceCopies()
+{
+    std::lock_guard<std::mutex> callbackLock(_callbackResourceMutex);
+
+    for (size_t i = 0; i < BUFFER_COUNT; i++)
+    {
+        // Destructors defer the release of their buffers
+        _hudlessTransfer[i].reset();
+        _uiTransfer[i].reset();
+        DeferredRelease::Release(_hudlessCopyResource[i]);
+    }
+
+    _hudCopy.reset();
+    _hudlessCompareCompute.reset();
+
+    IFGFeature_Dx12::ReleaseResourceCopies();
 }
 
 bool FSRFG_Dx12::ExecuteCommandList(int index)

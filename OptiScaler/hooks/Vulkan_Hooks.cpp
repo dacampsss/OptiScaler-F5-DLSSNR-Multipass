@@ -18,6 +18,7 @@
 #include <fsr4/FSR4DriverProviderVk.h>
 #include <proxies/FfxApi_Proxy.h>
 #include <misc/FrameLimit.h>
+#include <misc/DeferredRelease.h>
 #include "Reflex_Hooks.h"
 
 #include <spoofing/Vulkan_Spoofing.h>
@@ -1215,6 +1216,9 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
 
     auto result = o_vkCreateDevice(physicalDevice, &localCreteInfo, pAllocator, pDevice);
 
+    if (result == VK_SUCCESS)
+        DeferredRelease::DropOwnersExcept((uint64_t) *pDevice);
+
     if (result == VK_SUCCESS && nativeFg != nullptr)
     {
         nativeFg->OnDeviceCreated(*pDevice);
@@ -1537,6 +1541,10 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
             result = o_QueuePresentKHR(queue, &localPresentInfo);
         }
     }
+
+    // dxvk's presents are counted by the DXGI swapchain it goes through
+    if (!VkPresentBridge::DxvkGame())
+        DeferredRelease::Process();
 
     _presentTiming.Record(Stage::Present, Util::MillisecondsNow() - presentStartMs);
 

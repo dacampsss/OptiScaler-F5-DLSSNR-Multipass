@@ -3,6 +3,7 @@
 #include "IFeature_Vk.h"
 #include "State.h"
 #include "nvsdk_ngx_vk.h"
+#include <misc/DeferredRelease.h>
 #include <resource_tracking/GenericDepth_Vk.h>
 
 bool IFeature_Vk::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevice InDevice, VkCommandBuffer InCmdBuffer,
@@ -35,6 +36,9 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
 {
     // Optical F5Low stands aside while the game calls an upscaler of its own.
     GenericDepthVk::NoteUpscalerCall();
+
+    // Frees deferred objects even when presents aren't hooked
+    DeferredRelease::Collect();
 
     if (!IsInited())
     {
