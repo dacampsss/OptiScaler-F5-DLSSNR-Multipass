@@ -355,11 +355,19 @@ void ReportD3D12LiveObjects(ID3D12Device* device)
 #endif
 #endif
 
-// `proxy` and `display` are HDR output's (output/SdrToHdr_*): null for a chain it is not on
+// FG and the swapchain state belong to the game's swapchain, not to other windows' swapchains
+static bool IsCurrentSwapchain(IDXGISwapChain* swapchain)
+{
+    auto& state = State::Instance();
+    return state.currentSwapchain == swapchain || state.currentWrappedSwapchain == swapchain;
+}
+
+// `proxy` and `display` are HDR output's (output/SdrToHdr_*): null for a chain it is not on. `isCurrent`: this is the
+// game's current swapchain, only that one writes State
 static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags,
                             const DXGI_PRESENT_PARAMETERS* pPresentParameters, IUnknown* pDevice, HWND hWnd, bool isUWP,
                             SdrToHdr::ProxyChainBase* proxy = nullptr, const SdrToHdr::DisplayInfo* display = nullptr,
-                            bool upgraded = false)
+                            bool upgraded = false, bool isCurrent = true)
 {
     if (State::Instance().isShuttingDown)
     {
@@ -397,18 +405,26 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             ftDelta = now - _lastFrameTime;
 
         _lastFrameTime = now;
-        State::Instance().presentFrameTime = ftDelta;
 
-        if (State::Instance().currentFG == nullptr)
-            State::Instance().lastFGFrameTime = ftDelta;
+        if (isCurrent)
+        {
+            State::Instance().presentFrameTime = ftDelta;
+
+            if (State::Instance().currentFG == nullptr)
+                State::Instance().lastFGFrameTime = ftDelta;
+        }
 
         LOG_DEBUG("SyncInterval: {}, Flags: {:X}, Frametime: {:0.3f} ms", SyncInterval, Flags, ftDelta);
 
         // Update swapchain info evey frame
-        if (pSwapChain->GetDesc(&State::Instance().currentSwapchainDesc) != S_OK)
-            LOG_WARN("Can't get swapchain desc!");
-        else if (proxy != nullptr && proxy->Active())
-            State::Instance().currentSwapchainDesc.BufferDesc.Format = proxy->GameFormat(); // the game's, not the HDR one
+        if (isCurrent)
+        {
+            if (pSwapChain->GetDesc(&State::Instance().currentSwapchainDesc) != S_OK)
+                LOG_WARN("Can't get swapchain desc!");
+            else if (proxy != nullptr && proxy->Active())
+                State::Instance().currentSwapchainDesc.BufferDesc.Format =
+                    proxy->GameFormat(); // the game's, not the HDR one
+        }
     }
 
     ID3D11Device* device = nullptr;
@@ -427,8 +443,12 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             LOG_DEBUG("D3D11Device captured");
 
         _dx11Device = true;
-        State::Instance().swapchainApi = DX11;
-        State::Instance().currentD3D11Device = device;
+
+        if (isCurrent)
+        {
+            State::Instance().swapchainApi = DX11;
+            State::Instance().currentD3D11Device = device;
+        }
     }
     else if (pDevice->QueryInterface(IID_PPV_ARGS(&cq)) == S_OK)
     {
@@ -444,12 +464,12 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         // Not on the Vulkan bridge (native/VkPresentBridge.h): this is XeFG's D3D12 swapchain for a Vulkan game, whose own
         // present sets swapchainApi to Vulkan. Writing D3D12 here made the menu flip between the two. The D3D12 queue and
         // device below are still captured: frame generation needs them.
-        if (State::Instance().swapchainInteropApi != SwapchainInteropApi::VkwDx12)
+        if (isCurrent && State::Instance().swapchainInteropApi != SwapchainInteropApi::VkwDx12)
             State::Instance().swapchainApi = DX12;
 
         // Not while a Vulkan bridge's output is up or being let go of: this is XeFG's present on the bridge's private
         // queue, and the state's pointer to it is cleared on purpose when the output goes (native/VkPresentBridge.cpp)
-        if (State::Instance().currentCommandQueue == nullptr && !VkPresentBridge::OutputActive())
+        if (isCurrent && State::Instance().currentCommandQueue == nullptr && !VkPresentBridge::OutputActive())
             State::Instance().currentCommandQueue = cq;
 
         if (cq->GetDevice(IID_PPV_ARGS(&device12)) == S_OK)
@@ -461,7 +481,9 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 
             _dx12Device = true;
 
-            State::Instance().currentD3D12Device = device12;
+            if (isCurrent)
+                State::Instance().currentD3D12Device = device12;
+
             D3D12Hooks::HookDevice(device12);
         }
     }
@@ -546,7 +568,12 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         {
             SyncInterval = 0;
 
-            if (State::Instance().SCAllowTearing && !State::Instance().realExclusiveFullscreen)
+            // This swapchain's flags, the global ones can belong to a released or another swapchain
+            DXGI_SWAP_CHAIN_DESC scDesc {};
+            const bool allowTearing = pSwapChain->GetDesc(&scDesc) == S_OK &&
+                                      (scDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0 && scDesc.Windowed;
+
+            if (allowTearing && !State::Instance().realExclusiveFullscreen)
             {
                 LOG_DEBUG("Adding DXGI_PRESENT_ALLOW_TEARING");
                 Flags |= DXGI_PRESENT_ALLOW_TEARING;
@@ -607,7 +634,9 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             if (willPresent)
             {
                 _frameCounter++;
-                State::Instance().frameCount = _frameCounter;
+
+                if (isCurrent)
+                    State::Instance().frameCount = _frameCounter;
             }
 
             LOG_TRACE("3 {}", (UINT) presentResult);
@@ -733,7 +762,9 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 #endif
 
         _frameCounter++;
-        State::Instance().frameCount = _frameCounter;
+
+        if (isCurrent)
+            State::Instance().frameCount = _frameCounter;
     }
 
     LOG_DEBUG("Calling original present");
@@ -778,7 +809,8 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     if (lowLatencyDevice != nullptr)
         native::lowlatency::OnPresentEnd(lowLatencyDevice);
 
-    if (presentResult == S_OK)
+    // DXGI_STATUS_OCCLUDED etc. are not errors
+    if (SUCCEEDED(presentResult))
     {
         LOG_DEBUG("Original present result: {:X}", (UINT) presentResult);
     }
@@ -1073,6 +1105,11 @@ bool WrappedIDXGISwapChain4::OwnsMenuCleanup() const
 //
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::QueryInterface(REFIID riid, void** ppvObject)
 {
+    if (ppvObject == nullptr)
+        return E_POINTER;
+
+    *ppvObject = nullptr;
+
     LOG_TRACE("Caller: {}", Util::WhoIsTheCaller(_ReturnAddress()));
 
     if (riid == __uuidof(IDXGISwapChain))
@@ -1201,8 +1238,7 @@ ULONG STDMETHODCALLTYPE WrappedIDXGISwapChain4::Release()
             FGHooks::ReleaseBorderless(this);
 
         // Only the game's current swapchain takes frame generation down with it
-        const bool isCurrent =
-            State::Instance().currentSwapchain == this || State::Instance().currentWrappedSwapchain == this;
+        const bool isCurrent = IsCurrentSwapchain(this);
 
         // Menu's last command list can still be running
         if (!bridgeOwns && OwnsMenuCleanup())
@@ -1219,6 +1255,11 @@ ULONG STDMETHODCALLTYPE WrappedIDXGISwapChain4::Release()
 
         if (State::Instance().currentRealSwapchain == _real)
             State::Instance().currentRealSwapchain = nullptr;
+
+        // The game can release the queue with its swapchain (not the Vulkan bridge's, which VkPresentBridge clears)
+        if (!bridgeOwns && !_otherWindow && isCurrent && !VkPresentBridge::OutputActive() &&
+            State::Instance().currentCommandQueue == _device)
+            State::Instance().currentCommandQueue = nullptr;
 
         // Not for a chain on another window (MarkOtherWindow): frame generation lives on its own window's chain
         auto fg = State::Instance().currentFG;
@@ -1325,13 +1366,18 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
 
     if ((Flags & DXGI_PRESENT_TEST) == 0)
     {
-        result = LocalPresent(_real, SyncInterval, Flags, nullptr, _device, _handle, _uwp, Proxy(), &_display, _upgraded);
+        // Not the game's current chain (the current one is null before the first): leaves State alone. The Vulkan
+        // bridge and the D3D11 bridge present on chains that are not registered the same way, they stay current
+        const bool isCurrent = IsCurrentSwapchain(this) || State::Instance().currentSwapchain == nullptr ||
+                               State::Instance().swapchainInteropApi != SwapchainInteropApi::None;
+        result = LocalPresent(_real, SyncInterval, Flags, nullptr, _device, _handle, _uwp, Proxy(), &_display,
+                              _upgraded, isCurrent);
         RecoverFromExclusive(result);
 
         // When Reflex can't be used to limit (and Optical F5Low's low latency does not keep the cap), sleep in present
-        if (!State::Instance().reflexLimitsFps && !native::lowlatency::OwnsFrameCap() &&
-            State::Instance().activeFgOutput == FGOutput::NoFG &&
-            !IdentifyGpu::getPrimaryGpu().usesDxvk && !XellHooks::canLimit())
+        if (isCurrent && !State::Instance().reflexLimitsFps && !native::lowlatency::OwnsFrameCap() &&
+            State::Instance().activeFgOutput == FGOutput::NoFG && !IdentifyGpu::getPrimaryGpu().usesDxvk &&
+            !XellHooks::canLimit())
             FrameLimit::sleep();
     }
     else
@@ -1393,11 +1439,12 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::SetFullscreenState(BOOL Fullsc
             }
         }
 
-        State::Instance().realExclusiveFullscreen = Fullscreen;
-
         result = _real->SetFullscreenState(Fullscreen, pTarget);
 
-        if (result != S_OK)
+        if (result == S_OK && IsCurrentSwapchain(this))
+            State::Instance().realExclusiveFullscreen = Fullscreen;
+
+        if (FAILED(result))
             LOG_ERROR("result: {:X}", (UINT) result);
         else
             LOG_DEBUG("result: {:X}", result);
@@ -1527,13 +1574,22 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers(UINT BufferCount
         State::Instance().currentFG == nullptr)
     {
         LOG_DEBUG("Overriding flags");
-        SwapChainFlags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 
-        if (BufferCount < 2)
+        // ALLOW_TEARING can't change on resize
+        DXGI_SWAP_CHAIN_DESC scDesc {};
+        if (_real->GetDesc(&scDesc) == S_OK)
+        {
+            SwapChainFlags = (SwapChainFlags & ~DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) |
+                             (scDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+        }
+
+        // 0 keeps the current count
+        if (BufferCount == 1)
             BufferCount = 2;
     }
 
-    State::Instance().SCAllowTearing = (SwapChainFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) > 0;
+    if (IsCurrentSwapchain(this))
+        State::Instance().SCAllowTearing = (SwapChainFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) > 0;
 
     LOG_DEBUG("BufferCount: {0}, Width: {1}, Height: {2}, NewFormat: {3}, SwapChainFlags: {4:X}", BufferCount, Width,
               Height, (UINT) NewFormat, SwapChainFlags);
@@ -1632,7 +1688,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers(UINT BufferCount
         ReadDxgiInfoQueue();
 #endif
 
-    if (result == S_OK && State::Instance().currentFeature == nullptr)
+    if (SUCCEEDED(result) && State::Instance().currentFeature == nullptr)
     {
         State::Instance().screenWidth = static_cast<float>(Width);
         State::Instance().screenHeight = static_cast<float>(Height);
@@ -1753,14 +1809,16 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
 
     if ((Flags & DXGI_PRESENT_TEST) == 0)
     {
+        const bool isCurrent = IsCurrentSwapchain(this) || State::Instance().currentSwapchain == nullptr ||
+                               State::Instance().swapchainInteropApi != SwapchainInteropApi::None;
         result = LocalPresent(_real1, SyncInterval, Flags, pPresentParameters, _device, _handle, _uwp, Proxy(),
-                              &_display, _upgraded);
+                              &_display, _upgraded, isCurrent);
         RecoverFromExclusive(result);
 
         // When Reflex can't be used to limit (and Optical F5Low's low latency does not keep the cap), sleep in present
-        if (!State::Instance().reflexLimitsFps && !native::lowlatency::OwnsFrameCap() &&
-            State::Instance().activeFgOutput == FGOutput::NoFG &&
-            !IdentifyGpu::getPrimaryGpu().usesDxvk && !XellHooks::canLimit())
+        if (isCurrent && !State::Instance().reflexLimitsFps && !native::lowlatency::OwnsFrameCap() &&
+            State::Instance().activeFgOutput == FGOutput::NoFG && !IdentifyGpu::getPrimaryGpu().usesDxvk &&
+            !XellHooks::canLimit())
             FrameLimit::sleep();
     }
     else
@@ -2034,12 +2092,12 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
 
     if (ppPresentQueue != nullptr && *ppPresentQueue != nullptr)
     {
-        auto state = &State::Instance();
-        state->currentCommandQueue = (ID3D12CommandQueue*) *ppPresentQueue;
+        if (IsCurrentSwapchain(this))
+            State::Instance().currentCommandQueue = (ID3D12CommandQueue*) *ppPresentQueue;
 
-        if (_device != state->currentCommandQueue)
+        if (_device != *ppPresentQueue)
         {
-            _device = state->currentCommandQueue;
+            _device = *ppPresentQueue;
             WaitForGPUIdle(_device);
         }
     }
@@ -2065,16 +2123,27 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
         State::Instance().currentFG == nullptr)
     {
         LOG_DEBUG("Overriding flags");
-        SwapChainFlags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 
-        if (BufferCount < 2)
+        // ALLOW_TEARING can't change on resize
+        DXGI_SWAP_CHAIN_DESC scDesc {};
+        if (_real->GetDesc(&scDesc) == S_OK)
+        {
+            SwapChainFlags = (SwapChainFlags & ~DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) |
+                             (scDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+        }
+
+        // 0 keeps the current count
+        if (BufferCount == 1)
             BufferCount = 2;
     }
 
-    State::Instance().SCAllowTearing = (SwapChainFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) > 0;
+    if (IsCurrentSwapchain(this))
+        State::Instance().SCAllowTearing = (SwapChainFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) > 0;
 
     LOG_DEBUG("BufferCount: {}, Width: {}, Height: {}, NewFormat: {}, SwapChainFlags: {:X}", BufferCount, Width, Height,
               (UINT) Format, SwapChainFlags);
+
+    bool skResized = false;
 
     // Release swapchain backbuffers to prevent errors when resizing
     const bool isUsingOptiFgFeature =
@@ -2086,6 +2155,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
         if (_real->QueryInterface(IID_IUnwrappedDXGISwapChain, (void**) &skSC) == S_OK && skSC != nullptr)
         {
             skSC->Release();
+            skResized = true;
             LOG_DEBUG(
                 "Found SK swapchain, skip releasing backbuffersand using ResizeBuffers instead of ResizeBuffers1");
 
@@ -2159,14 +2229,18 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
     // HDR output, as in ResizeBuffers
     bool hdrHandled = false;
 
-    if (Config::Instance()->HdrOutputEnabled.value_or_default() || Proxy() != nullptr)
+    if (!skResized && (Config::Instance()->HdrOutputEnabled.value_or_default() || Proxy() != nullptr))
     {
         _lastFlags = SwapChainFlags;
         result = ResizeHdr(true, BufferCount, Width, Height, Format, SwapChainFlags, pCreationNodeMask, ppPresentQueue,
                            hdrHandled);
     }
 
-    if (hdrHandled)
+    if (skResized)
+    {
+        LOG_DEBUG("Resized with ResizeBuffers, result: {:X}", (UINT) result);
+    }
+    else if (hdrHandled)
     {
         // done by HDR output
     }
@@ -2193,7 +2267,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
         ReadDxgiInfoQueue();
 #endif
 
-    if (result == S_OK && State::Instance().currentFeature == nullptr)
+    if (SUCCEEDED(result) && State::Instance().currentFeature == nullptr)
     {
         State::Instance().screenWidth = static_cast<float>(Width);
         State::Instance().screenHeight = static_cast<float>(Height);

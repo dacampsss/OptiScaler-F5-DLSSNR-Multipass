@@ -292,6 +292,7 @@ bool XeFG_Dx12::DestroySwapchainContext()
         else
         {
             State::Instance().currentFGSwapchain = nullptr;
+            _allowLowerFrameId = true;
 
             // Its XeLL context isn't read anymore, unless a parked context (refused before) still links it: then it
             // goes once the last of those is destroyed (RetryParkedContexts)
@@ -437,8 +438,13 @@ bool XeFG_Dx12::CreateSwapchain(IDXGIFactory* factory, ID3D12CommandQueue* cmdQu
                               desc->BufferCount, desc->BufferDesc.Width, desc->BufferDesc.Height,
                               desc->BufferDesc.Format, desc->Flags) == S_OK;
 
+            if (!result)
+                return false;
+
             *swapChain = State::Instance().currentFGSwapchain;
-            return result;
+            (*swapChain)->AddRef();
+
+            return true;
         }
         // Game is creating new swapchain without releasing old one,
         // we need to release it to avoid errors
@@ -645,8 +651,13 @@ bool XeFG_Dx12::CreateSwapchain1(IDXGIFactory* factory, ID3D12CommandQueue* cmdQ
             auto result = State::Instance().currentFGSwapchain->ResizeBuffers(
                               desc->BufferCount, desc->Width, desc->Height, desc->Format, desc->Flags) == S_OK;
 
+            if (!result)
+                return false;
+
             *swapChain = (IDXGISwapChain1*) State::Instance().currentFGSwapchain;
-            return result;
+            (*swapChain)->AddRef();
+
+            return true;
         }
         // Game is creating new swapchain without releasing old one,
         // we need to release it to avoid errors
@@ -929,7 +940,7 @@ void XeFG_Dx12::Deactivate()
 
 void XeFG_Dx12::DestroyFGContext()
 {
-    Deactivate();
+    Disable();
 
     if (_fgContext != nullptr)
         _fgContext = nullptr;
@@ -1543,7 +1554,7 @@ void XeFG_Dx12::EvaluateState(ID3D12Device* device, FG_Constants& fgConstants)
     else
     {
         LOG_DEBUG("!FGEnabled");
-        Deactivate();
+        Disable();
         ReleaseResourceCopies();
         _depthInvert.reset();
 

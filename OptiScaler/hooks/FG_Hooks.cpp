@@ -54,6 +54,15 @@ static HANDLE _semaphore = nullptr;
 inline static std::vector<void*> oldBackBuffers;
 #endif
 
+// Keeps a reference to the FG swapchain's queue
+static void SetCurrentCommandQueue(ID3D12CommandQueue* cq)
+{
+    if (currentCommandQueue != nullptr)
+        currentCommandQueue->Release();
+
+    currentCommandQueue = cq;
+}
+
 static bool WaitForQueueIdle(ID3D12CommandQueue* queue)
 {
     std::scoped_lock lock(resizeFenceMutex);
@@ -429,11 +438,13 @@ HRESULT FGHooks::CreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
         }
 
         SdrToHdr::NoteGameFacingFrameGenChain();
+        SetCurrentCommandQueue(cq);
         SetFGSwapchain(*ppSwapChain, pDesc->OutputWindow);
 
         return S_OK;
     }
 
+    cq->Release();
     return E_INVALIDARG;
 }
 
@@ -543,11 +554,13 @@ HRESULT FGHooks::CreateSwapChainForHwnd(IDXGIFactory* pFactory, IUnknown* pDevic
         }
 
         SdrToHdr::NoteGameFacingFrameGenChain();
+        SetCurrentCommandQueue(cq);
         SetFGSwapchain((IDXGISwapChain*) *ppSwapChain, hWnd);
 
         return S_OK;
     }
 
+    cq->Release();
     return E_INVALIDARG;
 }
 
@@ -572,6 +585,10 @@ void FGHooks::SetFGSwapchain(IDXGISwapChain* pSwapChain, HWND hWnd)
 
     State::Instance().currentFGSwapchain = pSwapChain;
     State::Instance().currentSwapchain = pSwapChain;
+
+    // A preserved swapchain comes back as the same one
+    if (oldSwapChain == pSwapChain)
+        oldSwapChain = nullptr;
 
     HookFGSwapchain(pSwapChain);
 }
@@ -763,8 +780,6 @@ HRESULT FGHooks::hkSetFullscreenState(IDXGISwapChain* This, BOOL Fullscreen, IDX
         }
     }
 
-    State::Instance().realExclusiveFullscreen = Fullscreen;
-
     if (UsesXeFGApi(State::Instance().activeFgOutput) && Fullscreen)
         LOG_WARN("Using exclusive fullscreen with XeFG!!!");
 
@@ -775,6 +790,9 @@ HRESULT FGHooks::hkSetFullscreenState(IDXGISwapChain* This, BOOL Fullscreen, IDX
         result = o_FGSCSetFullscreenState(This, Fullscreen, pTarget);
         LOG_DEBUG("Fullscreen: {}, pTarget: {:X}, Result: {:X}", Fullscreen, (size_t) pTarget, (UINT) result);
     }
+
+    if (result == S_OK)
+        State::Instance().realExclusiveFullscreen = Fullscreen;
 
     if (result == S_OK && modeChanged)
     {
@@ -1484,8 +1502,17 @@ HRESULT FGHooks::hkResizeBuffers1(IDXGISwapChain3* This, UINT BufferCount, UINT 
         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
         _skipResize = true;
 
-        result = o_FGSCResizeBuffers1(This, BufferCount, Width, Height, Format, SwapChainFlags, pCreationNodeMask,
-                                      ppPresentQueue);
+        // FSR FG proxy doesn't implement ResizeBuffers1, it returns S_OK without resizing.
+        // Called through the vtable, _skipResize passes the hooked class to its original
+        if (State::Instance().activeFgOutput == FGOutput::FSRFG)
+        {
+            result = This->ResizeBuffers(BufferCount, Width, Height, Format, SwapChainFlags);
+        }
+        else
+        {
+            result = o_FGSCResizeBuffers1(This, BufferCount, Width, Height, Format, SwapChainFlags, pCreationNodeMask,
+                                          ppPresentQueue);
+        }
 
         _skipResize = false;
     }
@@ -1743,12 +1770,12 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
 
                 context->Release();
             }
-            else if (state.swapchainInteropApi == SwapchainInteropApi::None && state.currentCommandQueue != nullptr)
+            else if (state.swapchainInteropApi == SwapchainInteropApi::None && currentCommandQueue != nullptr)
             {
-                if (upscalerTimeOpt = currentFeature->ReadUpscalerTime(state.currentCommandQueue);
+                if (upscalerTimeOpt = currentFeature->ReadUpscalerTime(currentCommandQueue);
                     upscalerTimeOpt.has_value())
                 {
-                    currentFeature->ReadDetailedGpuTimes(state.currentCommandQueue, state.detailedGpuTimes);
+                    currentFeature->ReadDetailedGpuTimes(currentCommandQueue, state.detailedGpuTimes);
                 }
             }
 
@@ -2117,6 +2144,9 @@ ULONG FGHooks::hkFGRelease(IUnknown* This)
 
             LOG_DEBUG("FG Swapchain released, clearing currentFGSwapchain");
             State::Instance().currentFGSwapchain = nullptr;
+
+            // The queue goes with the swapchain, holding it would keep the game's device alive
+            SetCurrentCommandQueue(nullptr);
 
             // The emulated full screen went with it (HDR output's own keep is released by its owner)
             if (!_hdrKeeper.Active())
