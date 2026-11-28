@@ -36,6 +36,17 @@ int main()
     Check(!StabilizeAtNative(true, 1.0001f, true, false, CnnPreference, false),
           "compressed, scale rounds back to native: packed rule");
     Check(!StabilizeAtNative(true, 0.9f, true, false, CnnPreference, false), "compressed below 100%: packed rule");
+    // the flag worked out the way DlssNr_Dx12.cpp does: a scale that rounds back to native is not supersampled
+    Check(!StabilizeAtNative(true, 1.0001f, true,
+                             StabilizeSupersampled(true, 2560, 1440, WorkingExtent(2560, 1.0001f),
+                                                   WorkingExtent(1440, 1.0001f)),
+                             CnnPreference, false),
+          "compressed, 1.0001 as Dx12 works it out: packed rule");
+    Check(StabilizeAtNative(true, 1.2f, true,
+                            StabilizeSupersampled(true, 2560, 1440, WorkingExtent(2560, 1.2f),
+                                                  WorkingExtent(1440, 1.2f)),
+                            CnnPreference, false),
+          "compressed, 1.2 as Dx12 works it out: runs");
     Check(!StabilizeAtNative(false, 1.5f, true, true, CnnPreference, false), "compressed, setting off");
     Check(!StabilizeAtNative(true, 1.5f, true, true, NoPrivateDlss, false), "compressed, No DLSS");
     Check(!StabilizeAtNative(true, 1.5f, true, true, CnnPreference, true), "compressed, SR unavailable");

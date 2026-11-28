@@ -6622,6 +6622,10 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             superDownOk = true;
         }
+        // Supersampling under SuperiorAtNative without the native pair: the private DLSS skips this frame, so its
+        // history starts over on the next one instead of bridging the gap.
+        if (superiorGeneration && superiorSupersample && !superDownOk)
+            superiorGeneration->reset = true;
 
         // Reduced up-leg (mirrors the down-leg above). DlssNrReducedUpscaleMethod: 0 = Bilinear
         // (not SGSR1-enlarged), 1 = SGSR1 answer. The proxy side used to be independently
