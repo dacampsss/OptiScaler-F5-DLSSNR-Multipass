@@ -283,6 +283,11 @@ class Config
     // post-SR placement regardless of this setting.
     CustomOptional<bool> DlssNrRunBeforeSr { false };
     CustomOptional<bool> DlssNrFinishedPicture { false };
+    // Finished Picture on a game that renders on another queue than it presents on: how the present waits for the
+    // frame (DlssNr_CrossQueueGate.h). 0 never (skip frames still rendering, as 0.1.39), 1 always, 2 always except
+    // for a short settle after frame generation or the upscaler changes, 3 only while OptiScaler's frame generation
+    // is not attached.
+    CustomOptional<uint32_t> DlssNrFinishedGpuWait { 2 };
     // Generate NR before SR, upscale its signed contribution with a private DLSS feature,
     // and apply it after the game's upscaler. Takes precedence over RunBeforeSR; opt-in.
     CustomOptional<bool> DlssNrDeferredDlss { false };
