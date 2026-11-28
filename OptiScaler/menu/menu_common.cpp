@@ -4351,7 +4351,7 @@ void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
                     {
                         config->FGUIPremultipliedAlpha = uiPremultipliedAlpha;
                     }
-                    ShowHelpMarker("Only with Draw UI over. If the UI looks too faint, turn this off");
+                    ShowHelpMarker("Only with Draw UI over. If the UI looks too bright, turn this off");
 
                     ImGui::EndDisabled();
                     ImGui::EndTable();
@@ -8074,7 +8074,7 @@ void MenuCommon::RenderLoggingSettings(RenderMenuContext& ctx)
         }
 
         const char* logLevels[] = { "Trace", "Debug", "Information", "Warning", "Error" };
-        const char* selectedLevel = logLevels[config->LogLevel.value_or_default()];
+        const char* selectedLevel = logLevels[std::clamp(config->LogLevel.value_or_default(), 0, 4)];
 
         if (ImGui::BeginCombo("Log Level", selectedLevel))
         {

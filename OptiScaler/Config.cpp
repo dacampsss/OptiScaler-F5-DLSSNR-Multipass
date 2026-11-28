@@ -465,7 +465,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             else if (FsrNonLinearSRGB.has_value() && FsrNonLinearSRGB.value())
                 FsrNonLinearPQ.reset();
 
-            if (FsrNonLinearPQ.has_value() || FsrNonLinearSRGB.has_value())
+            if (FsrNonLinearPQ.value_or_default() || FsrNonLinearSRGB.value_or_default())
                 FsrNonLinearColorSpace.set_volatile_value(true);
         }
 
@@ -805,8 +805,8 @@ bool Config::Reload(std::filesystem::path iniPath)
                 AnisotropyOverride.reset();
 
             AnisotropySkipPointFilter.set_from_config(readBool("Anisotropy", "SkipPointFilter"));
-            AnisotropyModifyComp.set_from_config(readBool("Anisotropy", "AFModifyComparison"));
-            AnisotropyModifyMinMax.set_from_config(readBool("Anisotropy", "AFModifyMinMax"));
+            AnisotropyModifyComp.set_from_config(readBool("Anisotropy", "ModifyComparison"));
+            AnisotropyModifyMinMax.set_from_config(readBool("Anisotropy", "ModifyMinMax"));
         }
 
         // Mipmap
@@ -840,7 +840,9 @@ bool Config::Reload(std::filesystem::path iniPath)
 
             SimulateWaitableObject.set_from_config(readBool("Hotfix", "SimulateWaitableObject"));
 
-            RoundInternalResolution.set_from_config(readInt("Hotfix", "RoundInternalResolution"));
+            // 0 or less would divide by zero where the resolution is rounded
+            if (auto setting = readInt("Hotfix", "RoundInternalResolution"); setting.has_value() && setting > 0)
+                RoundInternalResolution.set_from_config(setting);
 
             RestoreComputeSignature.set_from_config(readBool("Hotfix", "RestoreComputeSignature"));
             RestoreGraphicSignature.set_from_config(readBool("Hotfix", "RestoreGraphicSignature"));
@@ -860,7 +862,7 @@ bool Config::Reload(std::filesystem::path iniPath)
 
         // Dx11 with Dx12
         {
-            Dx11DelayedInit.set_from_config(readInt("Dx11withDx12", "UseDelayedInit"));
+            Dx11DelayedInit.set_from_config(readBool("Dx11withDx12", "UseDelayedInit"));
             DontUseNTShared.set_from_config(readBool("Dx11withDx12", "DontUseNTShared"));
         }
 
