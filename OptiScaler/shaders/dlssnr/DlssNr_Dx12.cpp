@@ -4162,10 +4162,13 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         superiorPacked = false;
     }
     // [DlssNr] SuperiorAtNative: the private DLSS at 100% and above. Above 100% it works at native, on the pair after
-    // the supersample down-leg, while NR itself keeps its supersampled raster and its ordinary guides.
+    // the supersample down-leg, while NR itself keeps its supersampled raster and its ordinary guides. With Compress
+    // screen edges that pair is the unpacked one compression's own down-leg averages to native (pairDownOk below);
+    // the private DLSS's guides are then matched from the game's, as without compression.
     const bool superiorAtNative =
         superior && DlssNr::SuperiorScaling::StabilizeAtNative(
                         cfg.DlssNrSuperiorAtNative.value_or_default(), workScale, spatial,
+                        DlssNr::SuperiorScaling::StabilizeSupersampled(true, width, height, workWidth, workHeight),
                         cfg.DlssNrSuperiorScalingPreset.value_or_default(), superiorState.srUnavailable);
     const bool superiorSupersample =
         DlssNr::SuperiorScaling::StabilizeSupersampled(superiorAtNative, width, height, workWidth, workHeight);
